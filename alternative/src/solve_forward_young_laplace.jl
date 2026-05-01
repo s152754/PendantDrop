@@ -60,6 +60,7 @@ function solve_forward_young_laplace(
         if iter > params_num.nMaxIter
             #error("Newton-Raphson iteration of forward young-laplace did not converge in nMaxIter=$(params_num.nMaxIter) steps!")
             @warn("Newton-Raphson iteration of forward young-laplace did not converge in nMaxIter=$(params_num.nMaxIter) steps!")
+            println("params = $(params_phys)")
             return vars_sol
         end    
     
