@@ -21,22 +21,21 @@ begin
     import Pkg
     Pkg.activate(joinpath(@__DIR__))  # activates PendantDropModule's Project.toml
 	# declare the module being used from which you pull functions
+	using Revise
     using PendantDropModule
 
 	# separately declare which packages only the notebook needs to use (even if the module package also has a bunch of things it's using)
-	using ImageShow
+	using Images
 	using FileIO
-	using PlutoUI 
-    using Revise
-	
+	using PlutoUI 	
 	
 end
 
-# ╔═╡ 8934e799-d519-4a31-a093-efebe99295aa
-test(5)
-
 # ╔═╡ 383f13cd-3ddc-4beb-9430-29e776ba8fdf
 Pkg.status()
+
+# ╔═╡ 8934e799-d519-4a31-a093-efebe99295aa
+test(5)
 
 # ╔═╡ 7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
 md"""
@@ -50,10 +49,10 @@ If no image is selected, the notebook will run an example image.
 # ╔═╡ 7d38aebc-d602-426a-8b38-f67f26ed467a
 @bind chosen_file FilePicker([MIME("image/*")])
 
-# ╔═╡ 1effbeb2-3429-4120-8d53-250be0f2eb7f
-@bind reset_image CounterButton("Reset to default")
+# ╔═╡ 176dfcc1-4760-4af5-a3e3-9c60aba15ab6
+# img = load_file(chosen_file)
 
-# ╔═╡ fb2ec439-da78-43d5-881a-2cbc0e2f6cb4
+# ╔═╡ 808b0c4e-f5e5-4f8c-b87e-af2e2ae313af
 begin
 	if chosen_file !== nothing
 		img_bytes = chosen_file["data"] 
@@ -65,11 +64,56 @@ begin
 	end
 end
 
+# ╔═╡ fed39f0d-d6a8-4c02-8820-c79ef97ae0aa
+display_width = 600  # keep this in sync with the scale calc below
+
+# ╔═╡ c6449b7a-c726-4b9c-8056-8b43405c6986
+@bind roi_raw RectangleSelector(img; display_width=display_width)
+
+# ╔═╡ f5564d7d-3064-48a4-9369-b056cc59f416
+@bind weight PlutoUI.Slider(0.1:0.1:1.0; default=0.5, show_value=true)
+
+# ╔═╡ b27f1503-c683-46eb-9734-7fcb4a4283fd
+begin 
+	roi_img, orig_x_min, orig_y_min = extract_roi(img, roi_raw, display_width)
+	gradient_magnitude, smoothed_img = find_max_gradients(roi_img)
+	binary_mask, labeled_mask, component_length = build_binary_mask(gradient_magnitude, smoothed_img, weight)
+
+	Gray.(binary_mask)
+end
+
+# ╔═╡ e22b5b0b-0463-42a8-9440-f4b591310a3b
+@bind best_label PlutoUI.Slider(1:length(component_length); default=1, show_value=true)
+
+# ╔═╡ 8f586dbb-8249-4d40-8abf-9f65306cabeb
+@bind offset PlutoUI.Slider(-5:1:5; default=-1, show_value=true)
+
+# ╔═╡ c9392ed0-c3b4-4c9e-9d36-9b9da49b331d
+begin
+	droplet_mask, boundary_mask = extract_boundary_coordinates(labeled_mask, best_label, offset; contour_thickness=1)
+	nothing
+end
+
+# ╔═╡ aa604b07-579a-455f-967b-6f797ed2131c
+Gray.(droplet_mask)
+
+# ╔═╡ 9a5b656f-c6db-4b05-81d2-e73e759638a1
+Gray.(boundary_mask)
+
 # ╔═╡ Cell order:
 # ╠═eeaaf3e0-79f7-11f1-288b-f5b7b001c1bf
+# ╟─383f13cd-3ddc-4beb-9430-29e776ba8fdf
 # ╠═8934e799-d519-4a31-a093-efebe99295aa
-# ╠═383f13cd-3ddc-4beb-9430-29e776ba8fdf
 # ╟─7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
-# ╟─7d38aebc-d602-426a-8b38-f67f26ed467a
-# ╟─1effbeb2-3429-4120-8d53-250be0f2eb7f
-# ╠═fb2ec439-da78-43d5-881a-2cbc0e2f6cb4
+# ╠═7d38aebc-d602-426a-8b38-f67f26ed467a
+# ╠═176dfcc1-4760-4af5-a3e3-9c60aba15ab6
+# ╠═808b0c4e-f5e5-4f8c-b87e-af2e2ae313af
+# ╟─fed39f0d-d6a8-4c02-8820-c79ef97ae0aa
+# ╠═c6449b7a-c726-4b9c-8056-8b43405c6986
+# ╠═f5564d7d-3064-48a4-9369-b056cc59f416
+# ╠═b27f1503-c683-46eb-9734-7fcb4a4283fd
+# ╟─e22b5b0b-0463-42a8-9440-f4b591310a3b
+# ╠═aa604b07-579a-455f-967b-6f797ed2131c
+# ╠═8f586dbb-8249-4d40-8abf-9f65306cabeb
+# ╠═c9392ed0-c3b4-4c9e-9d36-9b9da49b331d
+# ╠═9a5b656f-c6db-4b05-81d2-e73e759638a1
