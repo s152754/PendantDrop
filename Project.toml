@@ -1,0 +1,28 @@
+name = "PendantDropModule"
+uuid = "e063d416-add0-4bdc-b6e1-20652304adf1"
+authors = ["A.M. Kadri <a.m.kadri@student.tue.nl>"]
+version = "0.1.0"
+
+[deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+HypertextLiteral = "ac1192a8-f4b3-4bfe-ba22-af5b92cd3ab2"
+ImageShow = "4e3cecfd-b093-5904-9786-8bbb286a6a31"
+Images = "916415d5-f1e6-5110-898d-aaa5f9f070e0"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+
+[compat]
+Base64 = "1.11.0"
+FileIO = "1.19.0"
+HypertextLiteral = "1.0.0"
+ImageShow = "0.3.8"
+Images = "0.26.2"
+JLD2 = "0.6.4"
+Plots = "1.41.6"
+PlutoUI = "0.7.83"
+Printf = "1.11.0"
+Revise = "3.15.1"

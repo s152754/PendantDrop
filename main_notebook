@@ -1,0 +1,75 @@
+### A Pluto.jl notebook ###
+# v0.20.13
+
+using Markdown
+using InteractiveUtils
+
+# This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
+macro bind(def, element)
+    #! format: off
+    return quote
+        local iv = try Base.loaded_modules[Base.PkgId(Base.UUID("6e696c72-6542-2067-7265-42206c756150"), "AbstractPlutoDingetjes")].Bonds.initial_value catch; b -> missing; end
+        local el = $(esc(element))
+        global $(esc(def)) = Core.applicable(Base.get, el) ? Base.get(el) : iv(el)
+        el
+    end
+    #! format: on
+end
+
+# ╔═╡ eeaaf3e0-79f7-11f1-288b-f5b7b001c1bf
+begin
+    import Pkg
+    Pkg.activate(joinpath(@__DIR__))  # activates PendantDropModule's Project.toml
+	# declare the module being used from which you pull functions
+    using PendantDropModule
+
+	# separately declare which packages only the notebook needs to use (even if the module package also has a bunch of things it's using)
+	using ImageShow
+	using FileIO
+	using PlutoUI 
+    using Revise
+	
+	
+end
+
+# ╔═╡ 8934e799-d519-4a31-a093-efebe99295aa
+test(5)
+
+# ╔═╡ 383f13cd-3ddc-4beb-9430-29e776ba8fdf
+Pkg.status()
+
+# ╔═╡ 7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
+md"""
+## Upload droplet image
+
+Select an image from your computer below for which you would like to detect the droplet shape. 
+
+If no image is selected, the notebook will run an example image.
+"""
+
+# ╔═╡ 7d38aebc-d602-426a-8b38-f67f26ed467a
+@bind chosen_file FilePicker([MIME("image/*")])
+
+# ╔═╡ 1effbeb2-3429-4120-8d53-250be0f2eb7f
+@bind reset_image CounterButton("Reset to default")
+
+# ╔═╡ fb2ec439-da78-43d5-881a-2cbc0e2f6cb4
+begin
+	if chosen_file !== nothing
+		img_bytes = chosen_file["data"] 
+		img = load(IOBuffer(img_bytes))
+	else 
+		img_url = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSpSdtJ3NdDYxIp5-Abe9PifEG_y-fDQP-QchWxLoLXMMpSfVtgRy0FKYS1GmWTjxx_QRs&usqp=CAU"
+		img_file = download(img_url)
+		img = load(img_file)
+	end
+end
+
+# ╔═╡ Cell order:
+# ╠═eeaaf3e0-79f7-11f1-288b-f5b7b001c1bf
+# ╠═8934e799-d519-4a31-a093-efebe99295aa
+# ╠═383f13cd-3ddc-4beb-9430-29e776ba8fdf
+# ╟─7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
+# ╟─7d38aebc-d602-426a-8b38-f67f26ed467a
+# ╟─1effbeb2-3429-4120-8d53-250be0f2eb7f
+# ╠═fb2ec439-da78-43d5-881a-2cbc0e2f6cb4
