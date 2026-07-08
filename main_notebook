@@ -37,6 +37,9 @@ Pkg.status()
 # ╔═╡ 8934e799-d519-4a31-a093-efebe99295aa
 test(5)
 
+# ╔═╡ 0f3645ea-eddc-451c-961f-930b0a4d90d1
+testing_fn(5)
+
 # ╔═╡ 7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
 md"""
 ## Upload droplet image
@@ -104,6 +107,7 @@ Gray.(boundary_mask)
 # ╠═eeaaf3e0-79f7-11f1-288b-f5b7b001c1bf
 # ╟─383f13cd-3ddc-4beb-9430-29e776ba8fdf
 # ╠═8934e799-d519-4a31-a093-efebe99295aa
+# ╠═0f3645ea-eddc-451c-961f-930b0a4d90d1
 # ╟─7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
 # ╠═7d38aebc-d602-426a-8b38-f67f26ed467a
 # ╠═176dfcc1-4760-4af5-a3e3-9c60aba15ab6

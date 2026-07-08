@@ -20,7 +20,11 @@ module PendantDropModule
     include("data_processing.jl")
     # include all other function files as needed for the notebook
 
+    include("testfunctions.jl")
+
     # exports from "data_processing.jl"
     export test, load_file, RectangleSelector, extract_roi, find_max_gradients, build_binary_mask, extract_boundary_coordinates
+
+    export testing_fn
 
 end # module PendantDropModule
