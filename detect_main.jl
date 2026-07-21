@@ -25,6 +25,10 @@ function Temp_detect(img_file)
     gray        = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     aruco_dict  = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     params      = cv2.aruco.DetectorParameters()
+    params.adaptiveThreshWinSizeMin  = 15
+    params.adaptiveThreshWinSizeMax  = 99     # push this well above one module's pixel size
+    params.adaptiveThreshWinSizeStep = 10     # coarser steps, fewer windows
+    params.minMarkerPerimeterRate = 0.05      # less noise
     detector    = cv2.aruco.ArucoDetector(aruco_dict, params)
 
     corners, ids, rejected = detector.detectMarkers(gray)

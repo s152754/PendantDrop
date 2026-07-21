@@ -28,6 +28,7 @@ begin
 	using Images
 	using FileIO
 	using PlutoUI 	
+	using Statistics
 	
 end
 
@@ -38,7 +39,10 @@ Pkg.status()
 test(5)
 
 # ╔═╡ 0f3645ea-eddc-451c-961f-930b0a4d90d1
-testing_fn(5)
+testing_fn(12)
+
+# ╔═╡ 005f3240-bc1a-4679-b2c6-20c00ccf1dd1
+mean(1:20)
 
 # ╔═╡ 7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
 md"""
@@ -108,6 +112,7 @@ Gray.(boundary_mask)
 # ╟─383f13cd-3ddc-4beb-9430-29e776ba8fdf
 # ╠═8934e799-d519-4a31-a093-efebe99295aa
 # ╠═0f3645ea-eddc-451c-961f-930b0a4d90d1
+# ╠═005f3240-bc1a-4679-b2c6-20c00ccf1dd1
 # ╟─7d5c8b85-4a5b-499d-ad30-e1f966a0a42a
 # ╠═7d38aebc-d602-426a-8b38-f67f26ed467a
 # ╠═176dfcc1-4760-4af5-a3e3-9c60aba15ab6
