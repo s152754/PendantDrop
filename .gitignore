@@ -1,0 +1,4 @@
+data/calibration_camera/
+data/test_droplets/
+test_images/
+.vscode/settings.json
