@@ -1165,7 +1165,7 @@ end
 
 module IntrinsicUncertainty
 using ..Camera: ensure_directory
-using FileIO, JLD2, Plots, PyCall, Random, Statistics
+using FileIO, JLD2, LinearAlgebra, LsqFit, Plots, PyCall, Random, Statistics
 
 include(joinpath(@__DIR__, "camera_uncertainties.jl"))
 end

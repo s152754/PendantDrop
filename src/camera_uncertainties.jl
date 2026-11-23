@@ -64,9 +64,10 @@ outputs:
 - corners_px [4×2 matrix of detected image corners, px]
 - ids [vector containing the detected marker ID]
 """
-function detect_aruco_corners(img_file::String, K, dist;
-                              marker_dict=nothing, aruco_params=nothing)
+function detect_aruco_corners(img_file::String, K, dist; marker_dict=nothing, aruco_params=nothing)
+    
     img_path = abspath(img_file)
+    
     py"""
 import cv2, numpy as np, os
 
@@ -113,6 +114,512 @@ result = (corners_px.tolist(), ids)
     return Float64.(corners_px), Int.(ids)
 end
 
+
+
+
+# Functions for defining uncertainty in ArUco corner position 
+
+function aruco_uncertainty_setup()
+    # TODO: decide if I need this as its own function
+    
+    # OpenCV is 0 based; Julia is 1 based
+    P = corners_px .+ 1
+    # 1 = black, 0 = white; invert for intensity profile fitting
+    Ig = 1 .- Float64.(Gray.(image_file));
+    # interpolate intensity for sub-pixel sampling
+    itp = linear_interpolation((1:size(Ig, 1), 1:size(Ig, 2)), 
+							   Ig; 
+							   extrapolation_bc = NaN
+							  );  # itp(row, col), NaN outside
+    ncols, nrows = 2, 2
+
+    return P, Ig, itp, ncols, nrows
+end
+
+function sigmoid(d::AbstractVector{<:Real}, p::AbstractVector{<:Real})
+    """
+    Sigmoid (logistic) edge model.
+
+    Arguments:
+    - d::AbstractVector{<:Real} - Positions (pixel offsets) at which the model is evaluated.
+    - p::AbstractVector{<:Real} - Parameters [baseline, amplitude, edge location, width].
+    
+	(the amplitude is signed, so rising and falling edges are both covered)
+
+    Returns:
+    - AbstractVector - Model values at each position in d.
+    """
+
+    return p[1] .+ p[2] ./ (1 .+ exp.(-(d .- p[3]) ./ p[4]))
+
+end
+
+function fit_corner(intensity_interpolant, opencv_corner::AbstractVector{<:Real}, edge_direction_a::AbstractVector{<:Real}, edge_direction_b::AbstractVector{<:Real}; profile_positions::AbstractVector{<:Real}, half::Real)
+    """
+	Estimates where a corner is located using intensity profiles.
+	-> Samples intensity profiles along several positions across a x and y edge 
+	-> Fits a sigmoid to each profile; the sigmoid centre estimates where the edge is located
+	-> Fits a straight line across those edge positions as a function of distance along the edge 
+	-> Intersects the two fitted edge lines to estimate where the corner is 
+	-> Compares the intensity-fitted corner coordinate to OpenCV's detected corner 
+	-> Estimates a corner correction q relative to the OpenCV coordinates 
+	-> Estimates covariance for the corner correction 
+
+    Arguments:
+    - intensity_interpolant - Image intensity interpolant, called as (row, col); should return NaN outside the image.
+    - opencv_corner::AbstractVector{<:Real} - OpenCV corner [x, y] (Julia convention).
+    - edge_direction_a::AbstractVector{<:Real} - Unit tangent vector [x] along edge A.
+    - edge_direction_b::AbstractVector{<:Real} - Unit tangent vector [y] along edge B.
+    - profile_positions::AbstractVector{<:Real} - Distances along each edge at which to sample profiles [px].
+    - half::Real: Half-width of each profile across the edge [px].
+
+    Returns:
+	Nothing, if either edges has fewer than four usable profiles. Otherwise, a named tuple: 
+	- q - Estimated edge-based corner minus opencv_corner
+	- Σ - Estimated covariance matrix of q
+	- edges - fitted information for each edge
+	- d - offsets across sampled profiles 
+ 
+    """
+
+	# Offsets across each edge profile, centered on the approximate corner 
+    profile_offsets = collect(-half:1.0:half)
+    edge_fit_results = []
+
+    for edge_tangent in (edge_direction_a, edge_direction_b)
+		# a perpendicular unit normal to this edge 
+        edge_normal = [-edge_tangent[2], edge_tangent[1]]
+        usable_profiles = []
+
+        for distance_along_edge in profile_positions
+			# starts at this position along the edge; samples across normal
+            profile_centre = opencv_corner .+ distance_along_edge .* edge_tangent
+            profile_intensities = intensity_interpolant.(
+				profile_centre[2] .+ profile_offsets .* edge_normal[2], 
+				profile_centre[1] .+ profile_offsets .* edge_normal[1]
+			)
+
+			# skip profiles that would require sampling outside the image 
+            any(isnan, profile_intensities) && continue
+
+			# estimate the 2 plateaus and use the steepest step to initilise the sigmoid's baseline, signed amplitude, centre and width
+            plateau_sample_count  = max(3, length(profile_intensities) ÷ 5)
+            left_plateau = mean(profile_intensities[1:plateau_sample_count])
+            right_plateau = mean(profile_intensities[end-plateau_sample_count+1:end])
+            steepest_step_index  = argmax(abs.(diff(profile_intensities)))
+			
+            initial_parameters = [
+				left_plateau, 
+				right_plateau - left_plateau, 
+				(profile_offsets[steepest_step_index] + profile_offsets[steepest_step_index + 1]) / 2, 
+				1.0
+			]
+
+			# fit the sigmoid; constrain its centre + width to the sampled range 
+            sigmoid_fit = try
+                curve_fit(
+					sigmoid, 
+					profile_offsets, 
+					profile_intensities, 
+					initial_parameters; 
+					lower = [-Inf, -Inf, -half, 0.3], 					
+					upper = [Inf, Inf, half, 10.0]
+				)
+            catch
+                nothing
+            end
+
+			# a failed fit or a v broad transition is not a useful edge
+            (sigmoid_fit === nothing || sigmoid_fit.param[4] > 9.5) && continue 
+			
+            push!(usable_profiles, 
+				  (distance_along_edge = distance_along_edge,
+				   profile_intensities = profile_intensities, 
+				   parameters = sigmoid_fit.param
+				  )
+				 )
+        end
+
+		# two fitted line parameters need more than two edge-position samples 
+        length(usable_profiles) < 4 && return nothing
+
+		# sigmoid centre (param 3) estimates edge offset for each profile
+        fitted_edge_offsets = [
+			profile.parameters[3] for profile in usable_profiles
+		]
+        fitted_distances = [profile.distance_along_edge for profile in usable_profiles
+		]
+
+		# model edge offset as intercept + slope * distance along edge 
+        line_design_matrix = [ones(length(fitted_distances)) fitted_distances]
+        # fit line coefficients (intercept, slope) to the edge offsets
+        line_coefficients = line_design_matrix \ fitted_edge_offsets
+        # compute residuals of the fitted line to estimate the scatter of the edge offsets
+		line_residuals = fitted_edge_offsets .- line_design_matrix * line_coefficients
+
+		# estimate line-coefficient covariance from residual scatter
+        residual_variance = sum(abs2, line_residuals) / 
+							(length(fitted_distances) - 2)
+        line_coefficient_covariance = 
+			residual_variance * inv(line_design_matrix' * line_design_matrix)
+			
+        push!(
+			edge_fit_results, 
+			  (
+				  t = edge_tangent, 
+				  n = edge_normal, 
+				  a0 = line_coefficients[1],
+				  b = line_coefficients[2], 
+				  σ = sqrt(line_coefficient_covariance[1, 1]), 
+                  residuals = line_residuals,
+                  residual_variance = residual_variance,
+				  profiles = usable_profiles
+			  )
+		)
+    end
+
+	first_edge = edge_fit_results[1]
+	second_edge = edge_fit_results[2]
+
+	# for a point q on an edge, its normal offset is a0 + b times its position along the tangent 
+	# rearranging gives a linear equation per edge
+
+	edge_intersection_matrix = [
+		(first_edge.n .- first_edge.b .* first_edge.t)'; 
+		(second_edge.n .- second_edge.b .* second_edge.t)'
+	]
+	edge_intercepts = [
+		first_edge.a0, second_edge.a0
+	]
+
+	# solve the two edge equationsfor the correction from the OpenCV corner 
+	corner_correction = edge_intersection_matrix \ edge_intercepts 
+
+	# propagate the two intercept variances through the line intersection
+	inverse_intersection_matrix = inv(edge_intersection_matrix)
+	correction_covariance = inverse_intersection_matrix * Diagonal([first_edge.σ^2, second_edge.σ^2]) * inverse_intersection_matrix'
+
+    return (q = corner_correction, 
+			Σ = correction_covariance, 
+			edges = edge_fit_results, 
+			d = profile_offsets,
+            opencv_corner = opencv_corner
+		   )
+
+end
+
+
+function plot_aruco_corner_corrections(corner_results)
+
+    """
+    plot_aruco_corner_corrections(corner_results)
+
+    Plot the x/y corrections returned by `fit_corner`, with their mean and
+    68% and 95% scatter ellipses.
+
+    Input:
+    - `corner_results`: Results from `fit_corner`; 
+                        `nothing` entries are ignored.
+                        At least two valid results are required.
+
+    Output:
+    - A plot object showing the corner corrections in pixels.
+
+    The ellipses summarise the scatter among valid corner corrections; they are
+    not the individual covariance matrices returned by `fit_corner`.
+    """
+
+    valid_results = [result for result in corner_results if result !== nothing]
+    length(valid_results) >= 2 ||
+        throw(ArgumentError("At least two valid corner fits are needed to plot corrections."))
+
+    corrections_px = Matrix{Float64}(undef, length(valid_results), 2)
+    for (i, result) in enumerate(valid_results)
+        corrections_px[i, :] = result.q
+    end
+
+    mean_correction_px = vec(mean(corrections_px; dims=1))
+    centered_corrections_px = corrections_px .- mean_correction_px'
+    correction_covariance_px2 =
+        centered_corrections_px' * centered_corrections_px /
+        (size(corrections_px, 1) - 1)
+
+    covariance_eigen = eigen(Symmetric(correction_covariance_px2))
+    angles = range(0, 2π; length=181)
+    unit_circle = [cos.(angles)'; sin.(angles)']
+
+    make_ellipse(scale) =
+        reshape(mean_correction_px, 2, 1) .+
+        scale .* covariance_eigen.vectors *
+        Diagonal(sqrt.(max.(covariance_eigen.values, 0))) *
+        unit_circle
+
+    ellipse_68 = make_ellipse(sqrt(2.30))
+    ellipse_95 = make_ellipse(sqrt(5.99))
+
+    correction_plot = Plots.scatter(
+        corrections_px[:, 1],
+        corrections_px[:, 2];
+        mc=:steelblue,
+        ms=4,
+        alpha=0.7,
+        label="corner corrections",
+        xlabel="x correction (px)",
+        ylabel="y correction (px)",
+        title="Edge-based correction relative to OpenCV",
+        aspect_ratio=:equal,
+        yflip=true,
+    )
+    Plots.vline!(correction_plot, [0.0]; lc=:black, ls=:dash, label="zero correction")
+    Plots.hline!(correction_plot, [0.0]; lc=:black, ls=:dash, label="")
+    Plots.plot!(
+        correction_plot, ellipse_95[1, :], ellipse_95[2, :];
+        lc=:orange, lw=2, label="95% scatter",
+    )
+    Plots.plot!(
+        correction_plot, ellipse_68[1, :], ellipse_68[2, :];
+        lc=:red, lw=2, label="68% scatter",
+    )
+    Plots.scatter!(
+        correction_plot,
+        [mean_correction_px[1]], [mean_correction_px[2]];
+        mc=:red, ms=7, marker=:star5, label="mean correction",
+    )
+
+    return correction_plot
+end
+
+
+function plot_aruco_corner_diagnostic(intensity::AbstractMatrix{<:Real},
+                                        corner_px::AbstractVector{<:Real},
+                                        result;
+                                        corner_index::Int,
+                                        edge_index::Int=2,
+                                        profile_index::Int=6,
+                                    )
+
+    """
+    Create a side-by-side diagnostic plot of a fitted sigmoid intensity profile and
+    its location on the image.
+
+    Inputs:
+    - `intensity`: 2D grayscale intensity matrix used for fitting.
+    - `corner_px`: Corner coordinates `[x, y]` in the image's one-based pixel
+    coordinate system.
+    - `result`: Successful `fit_corner` result for this corner.
+    - `corner_index`: Corner number, used in plot titles.
+    - `edge_index`: Which fitted edge to show; defaults to `2`.
+    - `profile_index`: Which profile on that edge to show; defaults to `6` and is
+    clamped to the available profiles.
+
+    Output:
+    - A combined plot showing the sampled profile, sigmoid fit, transition region,
+    and fitted corner overlaid on the image.
+
+    The shaded transition region represents the sigmoid's intensity transition,
+    not a confidence interval for the corner position.
+    """
+
+    1 <= edge_index <= length(result.edges) ||
+        throw(ArgumentError("edge_index is out of range."))
+
+    edge = result.edges[edge_index]
+    isempty(edge.profiles) &&
+        throw(ArgumentError("The selected edge has no usable profiles."))
+
+    selected_profile_index = clamp(profile_index, 1, length(edge.profiles))
+    profile = edge.profiles[selected_profile_index]
+    parameters = profile.parameters
+
+    edge_offset_px = parameters[3]
+    transition_half_width_px = abs(parameters[4]) * log(39)
+    transition_start_px = edge_offset_px - transition_half_width_px
+    transition_end_px = edge_offset_px + transition_half_width_px
+
+    fitted_d = range(minimum(result.d), maximum(result.d); length=400)
+    sigmoid_plot = Plots.scatter(
+        result.d,
+        profile.profile_intensities;
+        markersize=3,
+        mc=:black,
+        label="sampled intensity",
+        xlabel="Offset across edge, d [px]",
+        ylabel="Intensity",
+        ylims=(0, 1),
+        title="Corner $corner_index: edge $edge_index, profile $selected_profile_index",
+    )
+    Plots.plot!(
+        sigmoid_plot, fitted_d, sigmoid(fitted_d, parameters);
+        lc=:red, lw=2, label="sigmoid fit",
+    )
+    Plots.vspan!(
+        sigmoid_plot, [transition_start_px, transition_end_px];
+        fillcolor=:orange, fillalpha=0.25, label="95% transition interval",
+    )
+    Plots.vline!(
+        sigmoid_plot, [edge_offset_px];
+        lc=:blue, ls=:dash, label="chosen edge position",
+    )
+    Plots.scatter!(
+        sigmoid_plot,
+        [edge_offset_px], [sigmoid([edge_offset_px], parameters)[1]];
+        mc=:blue, marker=:star5, label="sigmoid center",
+    )
+
+    profile_center = corner_px .+ profile.distance_along_edge .* edge.t
+    edge_point = profile_center .+ edge_offset_px .* edge.n
+    transition_start = edge_point .- transition_half_width_px .* edge.n
+    transition_end = edge_point .+ transition_half_width_px .* edge.n
+    fitted_corner = corner_px .+ result.q
+
+    profile_positions = [
+        item.distance_along_edge
+        for fitted_edge in result.edges
+        for item in fitted_edge.profiles
+    ]
+    plot_extent = ceil(Int, maximum(abs.(vcat(result.d, profile_positions))) + 4)
+
+    image_height, image_width = size(intensity)
+    center_x, center_y = round.(Int, corner_px)
+    x_min = clamp(center_x - plot_extent, 1, image_width)
+    x_max = clamp(center_x + plot_extent, 1, image_width)
+    y_min = clamp(center_y - plot_extent, 1, image_height)
+    y_max = clamp(center_y + plot_extent, 1, image_height)
+    x_range = x_min:x_max
+    y_range = y_min:y_max
+
+    image_plot = Plots.heatmap(
+        collect(x_range), collect(y_range), intensity[y_range, x_range];
+        color=Plots.cgrad(:grays, rev=true),
+        yflip=true,
+        aspect_ratio=:equal,
+        clims=(0, 1),
+        colorbar=false,
+        xlabel="x [px]",
+        ylabel="y [px]",
+        title="Corner $corner_index: fitted location",
+    )
+
+    sample_x = profile_center[1] .+ result.d .* edge.n[1]
+    sample_y = profile_center[2] .+ result.d .* edge.n[2]
+    Plots.plot!(image_plot, sample_x, sample_y; lc=:cyan, lw=1.5, label="sampled profile")
+    Plots.plot!(
+        image_plot,
+        [transition_start[1], transition_end[1]],
+        [transition_start[2], transition_end[2]];
+        lc=:orange, lw=3, label="95% transition interval",
+    )
+    Plots.scatter!(
+        image_plot, [edge_point[1]], [edge_point[2]];
+        mc=:blue, marker=:star5, ms=6, label="sigmoid edge point",
+    )
+    Plots.scatter!(
+        image_plot, [corner_px[1]], [corner_px[2]];
+        mc=:magenta, ms=5, label="OpenCV corner",
+    )
+    Plots.scatter!(
+        image_plot, [fitted_corner[1]], [fitted_corner[2]];
+        mc=:lime, marker=:square, ms=4, label="fitted corner",
+    )
+
+    return Plots.plot(sigmoid_plot, image_plot; layout=(1, 2), size=(1100, 450))
+end
+
+function plot_aruco_edge_profile_residuals(
+    intensity::AbstractMatrix{<:Real},
+    result;
+    corner_index::Int,
+    edge_index::Int,
+)
+    1 <= edge_index <= length(result.edges) ||
+        throw(ArgumentError("edge_index is out of range."))
+
+    edge = result.edges[edge_index]
+    corner_px = result.opencv_corner
+    profiles = edge.profiles
+    n_profiles = length(profiles)
+    along_edge = [p.distance_along_edge for p in profiles]
+    detected_offsets = [p.parameters[3] for p in profiles]
+
+    # --- residuals ---
+    norm_factor     = sqrt(1 + edge.b^2)                        # normalisation factor for perpendicular distance
+    signed_distance = edge.residuals ./ norm_factor             # perpendicular distance from each detected edge point to the fitted line
+    mean_distance = mean(signed_distance)                       # mean perpendicular distance from detected edge points to the fitted line
+    σ_distance    = sqrt(edge.residual_variance) / norm_factor  # standard deviation of perpendicular distance from detected edge points to the fitted line
+
+    # --- image-space geometry ---
+    # unit normal to the fitted line, expressed in (s, c) coordinates
+    line_normal_sc = [-edge.b, 1.0] ./ norm_factor
+    to_pixels(s, c) = corner_px .+ s .* edge.t .+ c .* edge.n
+
+    detected_points = [to_pixels(s, c) for (s, c) in zip(along_edge, detected_offsets)]
+    foot_points = [
+        to_pixels(
+            s - d * line_normal_sc[1],
+            c - d * line_normal_sc[2],
+        ) for (s, c, d) in zip(along_edge, detected_offsets, signed_distance)
+    ]
+
+    line_positions = range(
+        min(0.0, minimum(along_edge)),
+        max(0.0, maximum(along_edge));
+        length=100,
+    )
+    fitted_line = [to_pixels(s, edge.a0 + edge.b * s) for s in line_positions]
+
+    # --- image panel ---
+    plot_extent = ceil(Int, maximum(abs.(vcat(along_edge, result.d))) + 8)
+    image_height, image_width = size(intensity)
+    center_x, center_y = round.(Int, corner_px)
+    x_range = clamp(center_x - plot_extent, 1, image_width):clamp(center_x + plot_extent, 1, image_width)
+    y_range = clamp(center_y - plot_extent, 1, image_height):clamp(center_y + plot_extent, 1, image_height)
+
+    image_plot = Plots.heatmap(
+        collect(x_range), collect(y_range), intensity[y_range, x_range];
+        color=Plots.cgrad(:grays, rev=true),
+        yflip=true, aspect_ratio=:equal, clims=(0, 1), colorbar=false,
+        xlabel="x [px]", ylabel="y [px]",
+        title="Corner $corner_index, edge $edge_index",
+    )
+    Plots.plot!(image_plot,
+        [p[1] for p in fitted_line], [p[2] for p in fitted_line];
+        lc=:lime, lw=2, label="fitted edge")
+    for i in 1:n_profiles
+        Plots.plot!(image_plot,
+            [foot_points[i][1], detected_points[i][1]],
+            [foot_points[i][2], detected_points[i][2]];
+            lc=:orange, lw=2,
+            label=i == 1 ? "perpendicular distance" : "")
+    end
+    Plots.scatter!(image_plot,
+        [p[1] for p in detected_points], [p[2] for p in detected_points];
+        mc=:steelblue, ms=4, label="detected edge points")
+
+    # --- distance panel ---
+    y_half = 1.3 * max(maximum(abs.(signed_distance .- mean_distance)), σ_distance)
+    y_limits = (mean_distance - y_half, mean_distance + y_half)
+
+    profile_numbers = collect(1:n_profiles)
+    distance_plot = Plots.hspan(
+        [mean_distance - σ_distance, mean_distance + σ_distance];
+        fillcolor=:orange, fillalpha=0.25, linecolor=:transparent,
+        label="mean ± 1σ (σ = $(round(σ_distance; digits=3)) px)",
+        xlims=(0.5, n_profiles + 0.5), ylims=y_limits,
+        xticks=(profile_numbers, ["P$i" for i in profile_numbers]),
+        xlabel="Profile",
+        ylabel="Perpendicular distance to fitted edge [px]",
+        title="Edge scatter about fitted line",
+    )
+    Plots.hline!(distance_plot, [mean_distance];
+        lc=:black, lw=2, label="mean = $(round(mean_distance; digits=3)) px")
+    Plots.hline!(distance_plot, [mean_distance - σ_distance, mean_distance + σ_distance];
+        lc=:orange, ls=:dash, lw=1.5, label="")
+    Plots.scatter!(distance_plot, profile_numbers, signed_distance;
+        mc=:steelblue, ms=6, label="detected edge")
+
+    return Plots.plot(image_plot, distance_plot;
+        layout=(1, 2), size=(1200, 500))
+end
 
 """
 Bootstrap ArUco marker extrinsics by perturbing detected corners and solving pose.
