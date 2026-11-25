@@ -279,8 +279,8 @@ if abspath(PROGRAM_FILE) == @__FILE__
         if result !== nothing && result["success"] == true
             println("\n=== Detection Results ===")
             println("Marker IDs: $(result["marker_ids"])")
-            println("Distance: $(result["marker_dist_mm"]:.2f} mm")
-            println("Scale: $(result["px_per_mm"]:.2f} px/mm")
+            println("Distance: $(round(result["marker_dist_mm"]; digits=2)) mm")
+            println("Scale: $(round(result["px_per_mm"]; digits=2)) px/mm")
         else
             println("No markers detected.")
         end
