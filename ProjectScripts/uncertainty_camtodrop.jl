@@ -35,6 +35,7 @@ const OUTPUT_FILE = joinpath(OUTPUT_DIR, "uncertainty_camtodrop.jld2")
 
 const SIGMA_PIX = 0.3                 # px; isotropic contour-pixel noise
 const SIGMA_POSE_OFFSET = 0.0         # mm; translation along the model-plane normal
+const ASSUMED_OFFSET_ACCURACY_MM = nothing  # Optional estimate; nothing disables verdict
 const N_MODEL_POINTS = 5_000
 const N_VIRTUAL_POINTS = 100          # Full covariance has size (2N)×(2N)
 const N_LINEAR_MC = 500
@@ -76,103 +77,8 @@ function resample_curve(values::AbstractVector{<:Real}, count::Int)
     return output
 end
 
-function stack_rz(r::AbstractVector, z::AbstractVector)
-    length(r) == length(z) || throw(ArgumentError("r and z lengths differ."))
-    output = Vector{promote_type(eltype(r), eltype(z))}(undef, 2 * length(r))
-    for i in eachindex(r, z)
-        output[2i - 1] = r[i]
-        output[2i] = z[i]
-    end
-    return output
-end
-
-function unstack_rz(values::AbstractVector)
-    iseven(length(values)) || throw(ArgumentError("Expected interleaved r,z values."))
-    return values[1:2:end], values[2:2:end]
-end
-
-function contour_normals(r::AbstractVector, z::AbstractVector)
-    length(r) == length(z) || throw(ArgumentError("r and z lengths differ."))
-    n = length(r)
-    n >= 2 || throw(ArgumentError("At least two contour points are required."))
-    normals = Matrix{Float64}(undef, n, 2)
-    for i in 1:n
-        left, right = i == 1 ? (1, 2) : i == n ? (n - 1, n) : (i - 1, i + 1)
-        dr = Float64(r[right] - r[left])
-        dz = Float64(z[right] - z[left])
-        magnitude = hypot(dr, dz)
-        magnitude > 0 || error("Degenerate contour tangent at point $i.")
-        normals[i, :] .= (-dz / magnitude, dr / magnitude)
-    end
-    return normals
-end
-
-function normal_covariance(covariance::AbstractMatrix, normals::AbstractMatrix)
-    n = size(normals, 1)
-    size(covariance) == (2n, 2n) ||
-        throw(ArgumentError("Covariance does not match the contour length."))
-    projected = Matrix{Float64}(undef, n, n)
-    for i in 1:n, j in 1:n
-        block = covariance[2i-1:2i, 2j-1:2j]
-        projected[i, j] = dot(view(normals, i, :), block * view(normals, j, :))
-    end
-    return projected
-end
-
-normal_sigmas(covariance, normals) =
-    sqrt.(max.(diag(normal_covariance(covariance, normals)), 0.0))
-
-function block_diagonal_extrinsic(Σ_rvec, Σ_t)
-    Σ = zeros(Float64, 6, 6)
-    Σ[1:3, 1:3] .= Σ_rvec
-    Σ[4:6, 4:6] .= Σ_t
-    return Σ
-end
-
-function rotation_log(R::AbstractMatrix{<:Real})
-    cosine = clamp((tr(R) - 1) / 2, -1.0, 1.0)
-    θ = acos(cosine)
-    vee = Float64[R[3, 2] - R[2, 3], R[1, 3] - R[3, 1], R[2, 1] - R[1, 2]]
-    θ < 1e-8 && return vee ./ 2
-    abs(sin(θ)) > 1e-12 ||
-        error("Cannot compute a stable rotation-vector increment near angle π.")
-    return (θ / (2sin(θ))) .* vee
-end
-
-function summarize_pose_samples(R_samples, t_samples)
-    length(R_samples) == length(t_samples) ||
-        throw(ArgumentError("Rotation and translation sample counts differ."))
-    length(R_samples) >= 2 ||
-        throw(ArgumentError("At least two pose samples are required."))
-
-    R_mean = copy(first(R_samples))
-    for _ in 1:10
-        increments = [
-            rotation_log(transpose(R_mean) * R) for R in R_samples
-        ]
-        mean_increment = vec(mean(reduce(hcat, increments); dims=2))
-        R_mean = UQ._right_perturbed_rotation(R_mean, mean_increment)
-        norm(mean_increment) < 1e-12 && break
-    end
-
-    samples = Matrix{Float64}(undef, length(R_samples), 6)
-    for i in eachindex(R_samples, t_samples)
-        samples[i, 1:3] .=
-            rotation_log(transpose(R_mean) * R_samples[i])
-        samples[i, 4:6] .= Float64.(t_samples[i])
-    end
-    t_mean = vec(mean(samples[:, 4:6]; dims=1))
-    samples[:, 4:6] .-= reshape(t_mean, 1, 3)
-    covariance = Matrix{Float64}(cov(samples; dims=1))
-    return R_mean, t_mean, covariance
-end
-
-function correlation_matrix(covariance)
-    standard_deviations = sqrt.(max.(diag(covariance), 0.0))
-    denominator = standard_deviations * transpose(standard_deviations)
-    return covariance ./ max.(denominator, eps(Float64))
-end
-
+# DEPRECATED: unused as of the uncertainty reorganization; candidate for deletion.
+#=
 function sample_covariance_from_pose_cache(R_mean, t_mean)
     candidate_files = [
         joinpath(EXTRINSIC_DIR, "extrinsic_bootstrap_$(ZOOM_LEVEL)_N1000.jld2"),
@@ -206,6 +112,7 @@ function sample_covariance_from_pose_cache(R_mean, t_mean)
     @warn "No saved extrinsic pose samples found; using block-diagonal extrinsic covariance."
     return nothing, nothing
 end
+=#
 
 function load_or_fit_aruco_corners(K, dist)
     cached_paths = (
@@ -300,74 +207,15 @@ function apex_radius_measure(r, z)
     return curvature > eps(Float64) ? 1 / (2curvature) : Inf
 end
 
-function covariance_terms(jacobians, Σ_intrinsics, Σ_ext_block, Σ_ext_full,
-                          sigma_pix, sigma_pose_offset)
-    Ji, Je, Jp, Jo = jacobians.J_intrinsics, jacobians.J_extrinsics,
-                     jacobians.J_pixels, jacobians.J_offset
-    camera_block = Ji * Σ_intrinsics * transpose(Ji) +
-                   Je * Σ_ext_block * transpose(Je)
-    camera_full = Ji * Σ_intrinsics * transpose(Ji) +
-                  Je * Σ_ext_full * transpose(Je)
-    pixel_term = (sigma_pix^2) .* (Jp * transpose(Jp))
-    offset_term = (sigma_pose_offset^2) .* (Jo * transpose(Jo))
-    return (
-        camera_block=Matrix(Symmetric(camera_block)),
-        camera_full=Matrix(Symmetric(camera_full)),
-        pixel=Matrix(Symmetric(pixel_term)),
-        offset=Matrix(Symmetric(offset_term)),
-        total_block=Matrix(Symmetric(camera_block + pixel_term + offset_term)),
-        total_full=Matrix(Symmetric(camera_full + pixel_term + offset_term)),
-        camera_plus_offset=Matrix(Symmetric(camera_full + offset_term)),
-    )
-end
-
-function sample_inverse_contour(
-    pixels_u, pixels_v, phi, extrinsic_delta, pose_offset, R_mean, t_mean,
-    R_rel, t_rel,
-)
-    parameters = vcat(phi, extrinsic_delta, pose_offset)
-    r, z = UQ.inverse_project_camtodrop(
-        pixels_u, pixels_v, parameters, R_mean, t_mean, R_rel, t_rel;
-        plane_coordinate=PLANE_COORDINATE_MM,
-    )
-    return stack_rz(r, z)
-end
-
-function print_leading_modes(covariance, r, z; count=5)
-    decomposition = eigen(Symmetric(covariance))
-    order = sortperm(decomposition.values; rev=true)
-    centroid = [mean(r), mean(z)]
-    rigid = zeros(Float64, 2 * length(r), 3)
-    for i in eachindex(r)
-        rigid[2i - 1, 1] = 1
-        rigid[2i, 2] = 1
-        rigid[2i - 1, 3] = -(z[i] - centroid[2])
-        rigid[2i, 3] = r[i] - centroid[1]
-    end
-    Qrigid = Matrix(qr(rigid).Q)[:, 1:3]
-    scale = stack_rz(r .- centroid[1], z .- centroid[2])
-    scale_residual = scale - Qrigid * (transpose(Qrigid) * scale)
-    scale_residual ./= max(norm(scale_residual), eps(Float64))
-    println("\nLeading camera-covariance modes (translation/rotation, scale, shape):")
-    rows = min(count, length(order))
-    for rank in 1:rows
-        index = order[rank]
-        vector = decomposition.vectors[:, index]
-        rigid_fraction = sum(abs2, transpose(Qrigid) * vector)
-        scale_fraction = abs2(dot(scale_residual, vector))
-        shape_fraction = max(0.0, 1 - rigid_fraction - scale_fraction)
-        @printf(
-            "  %d: λ=%.6g  rigid=%.1f%%  scale=%.1f%%  shape=%.1f%%\n",
-            rank, decomposition.values[index], 100 * rigid_fraction,
-            100 * scale_fraction, 100 * shape_fraction,
-        )
-    end
-    return decomposition.values[order], decomposition.vectors[:, order]
-end
-
 function main()
     SIGMA_PIX >= 0 || error("SIGMA_PIX must be nonnegative.")
     SIGMA_POSE_OFFSET >= 0 || error("SIGMA_POSE_OFFSET must be nonnegative.")
+    if ASSUMED_OFFSET_ACCURACY_MM !== nothing
+        ASSUMED_OFFSET_ACCURACY_MM isa Real &&
+            isfinite(ASSUMED_OFFSET_ACCURACY_MM) &&
+            ASSUMED_OFFSET_ACCURACY_MM >= 0 ||
+            error("ASSUMED_OFFSET_ACCURACY_MM must be nothing or finite and nonnegative.")
+    end
     N_JOINT_MC >= 2 && N_LINEAR_MC >= 2 ||
         error("Monte Carlo sample counts must be at least two.")
 
@@ -408,24 +256,24 @@ function main()
             seed=SEED + 3,
         )
     R_mean, t_mean, Σ_ext_full =
-        summarize_pose_samples(baseline_R_samples, baseline_t_samples)
+        UQ.summarize_pose_samples(baseline_R_samples, baseline_t_samples)
     Σ_rvec = Matrix(Σ_ext_full[1:3, 1:3])
     Σ_t = Matrix(Σ_ext_full[4:6, 4:6])
-    Σ_ext_block = block_diagonal_extrinsic(Σ_rvec, Σ_t)
+    Σ_ext_block = UQ.block_diagonal_extrinsic(Σ_rvec, Σ_t)
     extrinsic_sample_file = "recomputed from fitted corners and their covariance"
 
-    legacy_Σ_ext = block_diagonal_extrinsic(legacy_Σ_rvec, legacy_Σ_t)
+    legacy_Σ_ext = UQ.block_diagonal_extrinsic(legacy_Σ_rvec, legacy_Σ_t)
     stored_sd = sqrt.(max.(diag(legacy_Σ_ext), 0.0))
     baseline_sd = sqrt.(max.(diag(Σ_ext_full), 0.0))
     println("\nFixed-intrinsics bootstrap sanity check (recomputed / stored SD):")
     println("  ratios [δrvec(rad), δt(mm)] = ",
             baseline_sd ./ max.(stored_sd, eps(Float64)))
     println("  recomputed 6×6 pose correlation matrix:")
-    display(round.(correlation_matrix(Σ_ext_full); digits=3))
+    display(round.(UQ.correlation_matrix(Σ_ext_full); digits=3))
     println("  stored rotation correlation matrix:")
-    display(round.(correlation_matrix(legacy_Σ_rvec); digits=3))
+    display(round.(UQ.correlation_matrix(legacy_Σ_rvec); digits=3))
     println("  stored translation correlation matrix:")
-    display(round.(correlation_matrix(legacy_Σ_t); digits=3))
+    display(round.(UQ.correlation_matrix(legacy_Σ_t); digits=3))
     # Bootstrap increments are right perturbations: R_sample = R_mean * exp(δrvec).
 
     physical_r, physical_z, _, hits = Model.PD_fn(
@@ -462,13 +310,14 @@ function main()
         R_mean, t_mean, R_rel, T_REL_MM;
         plane_coordinate=PLANE_COORDINATE_MM,
     )
-    terms = covariance_terms(
+    terms = UQ.covariance_terms(
         jacobians, Σ_intrinsics, Σ_ext_block, Σ_ext_full,
         SIGMA_PIX, SIGMA_POSE_OFFSET,
     )
-    normals = contour_normals(jacobians.coordinates[1:2:end],
-                              jacobians.coordinates[2:2:end])
-    independent_normal_sigma = normal_sigmas(terms.camera_full + terms.offset, normals)
+    normals = UQ.contour_normals(jacobians.coordinates[1:2:end],
+                                 jacobians.coordinates[2:2:end])
+    independent_normal_sigma =
+        UQ.normal_sigmas(terms.camera_full + terms.offset, normals)
 
     rng = MersenneTwister(SEED)
     linear_samples = Matrix{Float64}(undef, N_LINEAR_MC, 2N_VIRTUAL_POINTS)
@@ -479,15 +328,16 @@ function main()
     for sample_index in 1:N_LINEAR_MC
         sampled_parameters = UQ.sample_gaussian(rng, parameter_mean, Σ_independent)
         offset_sample = SIGMA_POSE_OFFSET * randn(rng)
-        linear_samples[sample_index, :] .= sample_inverse_contour(
+        linear_samples[sample_index, :] .= UQ.sample_inverse_contour(
             virtual_u, virtual_v, sampled_parameters[1:9],
             sampled_parameters[10:15], offset_sample,
             R_mean, t_mean, R_rel, T_REL_MM,
+            plane_coordinate=PLANE_COORDINATE_MM,
         )
     end
     Σ_linear_mc = Matrix{Float64}(cov(linear_samples; dims=1))
-    mc_normal_sigma = normal_sigmas(Σ_linear_mc, normals)
-    linear_normal_sigma = normal_sigmas(terms.camera_full + terms.offset, normals)
+    mc_normal_sigma = UQ.normal_sigmas(Σ_linear_mc, normals)
+    linear_normal_sigma = UQ.normal_sigmas(terms.camera_full + terms.offset, normals)
     println("\nCovariance component summaries [model-local mm²]:")
     for (label, matrix) in (
         ("camera, block-diagonal extrinsics", terms.camera_block),
@@ -504,11 +354,11 @@ function main()
     )
 
     values_linear, vectors_linear =
-        print_leading_modes(terms.camera_full, jacobians.coordinates[1:2:end],
-                            jacobians.coordinates[2:2:end])
+        UQ.print_leading_modes(terms.camera_full, jacobians.coordinates[1:2:end],
+                              jacobians.coordinates[2:2:end])
     values_mc, vectors_mc =
-        print_leading_modes(Σ_linear_mc, jacobians.coordinates[1:2:end],
-                            jacobians.coordinates[2:2:end])
+        UQ.print_leading_modes(Σ_linear_mc, jacobians.coordinates[1:2:end],
+                              jacobians.coordinates[2:2:end])
     println("\nLeading covariance eigenvalue comparison (linear vs MC):")
     for i in 1:min(5, length(values_linear), length(values_mc))
         cosine = abs(dot(vectors_linear[:, i], vectors_mc[:, i]))
@@ -530,29 +380,81 @@ function main()
     joint_samples = Matrix{Float64}(undef, N_JOINT_MC, 2N_VIRTUAL_POINTS)
     joint_apex_radius = Vector{Float64}(undef, N_JOINT_MC)
     for i in 1:N_JOINT_MC
-        rotation_delta = rotation_log(transpose(R_mean) * R_joint[i])
+        rotation_delta = UQ.rotation_log(transpose(R_mean) * R_joint[i])
         translation_delta = t_joint[i] .- t_mean
         offset_sample = SIGMA_POSE_OFFSET * randn(rng_intrinsic)
-        joint_camera_samples[i, :] .= sample_inverse_contour(
+        joint_camera_samples[i, :] .= UQ.sample_inverse_contour(
             virtual_u, virtual_v, intrinsic_samples[i, :],
             vcat(rotation_delta, translation_delta), 0.0,
             R_mean, t_mean, R_rel, T_REL_MM,
+            plane_coordinate=PLANE_COORDINATE_MM,
         )
-        joint_samples[i, :] .= sample_inverse_contour(
+        joint_samples[i, :] .= UQ.sample_inverse_contour(
             virtual_u, virtual_v, intrinsic_samples[i, :],
             vcat(rotation_delta, translation_delta), offset_sample,
             R_mean, t_mean, R_rel, T_REL_MM,
+            plane_coordinate=PLANE_COORDINATE_MM,
         )
-        r_sample, z_sample = unstack_rz(view(joint_samples, i, :))
+        r_sample, z_sample = UQ.unstack_rz(view(joint_samples, i, :))
         joint_apex_radius[i] = apex_radius_measure(r_sample, z_sample)
     end
     Σ_joint_camera_mc = Matrix{Float64}(cov(joint_camera_samples; dims=1))
     Σ_joint_mc = Matrix{Float64}(cov(joint_samples; dims=1))
     Σ_total_joint = Matrix(Symmetric(Σ_joint_mc + terms.pixel))
-    joint_normal_sigma = normal_sigmas(Σ_joint_mc, normals)
-    joint_camera_normal_sigma = normal_sigmas(Σ_joint_camera_mc, normals)
-    joint_total_normal_sigma = normal_sigmas(Σ_total_joint, normals)
-    pixel_normal_sigma = normal_sigmas(terms.pixel, normals)
+    joint_normal_sigma = UQ.normal_sigmas(Σ_joint_mc, normals)
+    joint_camera_normal_sigma = UQ.normal_sigmas(Σ_joint_camera_mc, normals)
+    joint_total_normal_sigma = UQ.normal_sigmas(Σ_total_joint, normals)
+    pixel_normal_sigma = UQ.normal_sigmas(terms.pixel, normals)
+
+    position_assessment = nothing
+    if SIGMA_POSE_OFFSET == 0.0
+        position_assessment = UQ.relative_position_assessment(
+            jacobians.J_offset, normals, joint_camera_normal_sigma, t_mean,
+        )
+        println(
+            "\nRelative-position assessment (drop assumed in the marker plane, δ = 0):",
+        )
+        @printf(
+            "  Camera-marker distance Z = %.1f mm (ArUco optical depth |t_mean[3]|).\n",
+            position_assessment.camera_marker_distance_mm,
+        )
+        @printf(
+            "  A depth offset of 1 mm moves the contour by ~%.0f µm (median) and gives ~%.1f%% scale error, ~%.1f%% surface-tension error.\n",
+            1_000 * position_assessment.median_normal_sigma_per_mm_offset,
+            100 * position_assessment.relative_scale_error_per_mm,
+            100 * position_assessment.relative_surface_tension_error_per_mm,
+        )
+        @printf(
+            "  The camera-model uncertainty (median joint normal σ = %.0f µm) equals the effect of an offset of δ* = %.2f mm.\n",
+            1_000 * position_assessment.median_joint_camera_normal_sigma_mm,
+            position_assessment.break_even_offset_mm,
+        )
+        if ASSUMED_OFFSET_ACCURACY_MM === nothing
+            println(
+                "  → If the drop-marker depth is known better than δ*, neglecting it is justified: the camera model dominates.",
+            )
+            println(
+                "  → Otherwise, relative position dominates; include it with SIGMA_POSE_OFFSET or measure it more accurately.",
+            )
+        elseif ASSUMED_OFFSET_ACCURACY_MM <= position_assessment.break_even_offset_mm
+            @printf(
+                "  Verdict: assumed depth accuracy %.3f mm is at or below δ*; the camera model dominates.\n",
+                ASSUMED_OFFSET_ACCURACY_MM,
+            )
+        else
+            @printf(
+                "  Verdict: assumed depth accuracy %.3f mm exceeds δ*; relative position dominates and should be included or measured more accurately.\n",
+                ASSUMED_OFFSET_ACCURACY_MM,
+            )
+        end
+        println(
+            "  Surface-tension error assumes it scales with the square of drop size.",
+        )
+        println(
+            "  This error is systematic for this mount and does not average out over repeated measurements.",
+        )
+    end
+
     normal_ratio = joint_normal_sigma ./ max.(independent_normal_sigma, eps(Float64))
     println("\nJoint-bootstrap comparison (joint reference / independent model):")
     println(
@@ -617,10 +519,10 @@ function main()
     ); color=:orange, fillalpha=0.16, linealpha=0, label="Joint bootstrap, 1σ")
     savefig(plot_bands, joinpath(OUTPUT_DIR, "normal_uncertainty_bands.png"))
 
-    Σ_normal_camera = normal_covariance(terms.camera_full, normals)
-    Σ_normal_pixel = normal_covariance(terms.pixel, normals)
-    Σ_normal_total = normal_covariance(terms.total_full, normals)
-    Σ_normal_joint = normal_covariance(Σ_joint_mc, normals)
+    Σ_normal_camera = UQ.normal_covariance(terms.camera_full, normals)
+    Σ_normal_pixel = UQ.normal_covariance(terms.pixel, normals)
+    Σ_normal_total = UQ.normal_covariance(terms.total_full, normals)
+    Σ_normal_joint = UQ.normal_covariance(Σ_joint_mc, normals)
     metadata = Dict(
         "parameter_order" => collect(jacobians.parameter_order),
         "intrinsic_order" => [
@@ -651,6 +553,8 @@ function main()
         "seed" => SEED,
         "sigma_pix_px" => SIGMA_PIX,
         "sigma_pose_offset_mm" => SIGMA_POSE_OFFSET,
+        "assumed_offset_accuracy_mm" => ASSUMED_OFFSET_ACCURACY_MM,
+        "relative_position_assessment" => position_assessment,
         "roundtrip_max_error_mm" => max_roundtrip_error,
     )
     JLD2.jldsave(
@@ -663,7 +567,7 @@ function main()
         Σ_intrinsics,
         Σ_rvec,
         Σ_t,
-        rvec_mean=rotation_log(R_mean),
+        rvec_mean=UQ.rotation_log(R_mean),
         t_mean,
         Σ_ext_block,
         Σ_ext_full,

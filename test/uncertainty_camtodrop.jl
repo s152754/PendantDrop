@@ -131,3 +131,24 @@ end
     end
     @test implicit_jacobian ≈ finite_difference atol=1e-7 rtol=2e-5
 end
+
+@testset "Relative-position assessment" begin
+    J_offset = reshape(Float64[0.01, 0.0, 0.02, 0.0], 4, 1)
+    normals = Float64[1 0; 1 0]
+    joint_camera_normal_sigma = Float64[0.03, 0.06]
+    t_mean = Float64[2.0, -1.0, 50.0]
+
+    assessment = UQ.relative_position_assessment(
+        J_offset, normals, joint_camera_normal_sigma, t_mean,
+    )
+
+    @test assessment.camera_marker_distance_mm == 50.0
+    @test assessment.median_normal_sigma_per_mm_offset ≈ 0.015
+    @test assessment.median_joint_camera_normal_sigma_mm ≈ 0.045
+    @test assessment.break_even_offset_mm ≈ 3.0
+    @test assessment.relative_scale_error_per_mm ≈ 1 / 50
+    @test assessment.relative_surface_tension_error_per_mm ≈ 2 / 50
+    @test_throws ArgumentError UQ.relative_position_assessment(
+        J_offset, normals, joint_camera_normal_sigma, Float64[0.0, 0.0, 0.0],
+    )
+end

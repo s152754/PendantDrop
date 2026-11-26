@@ -6,6 +6,8 @@ intrinsic-parameter uncertainty estimation, and plotting helpers. It relies on
 packages and helpers loaded by the parent camera module; do not include it alone.
 """
 
+using Printf
+
 
 # Internal conversion helpers
 
@@ -119,6 +121,8 @@ end
 
 # Functions for defining uncertainty in ArUco corner position 
 
+# DEPRECATED: unused as of the uncertainty reorganization; candidate for deletion.
+#=
 function aruco_uncertainty_setup()
     # TODO: decide if I need this as its own function
     
@@ -135,6 +139,7 @@ function aruco_uncertainty_setup()
 
     return P, Ig, itp, ncols, nrows
 end
+=#
 
 function sigmoid(d::AbstractVector{<:Real}, p::AbstractVector{<:Real})
     """
@@ -2198,4 +2203,215 @@ result = (rotations, translations)
         Float64.(vec(t_raw[i, :])) for i in axes(t_raw, 1)
     ]
     return R_samples, t_samples
+end
+
+function stack_rz(r::AbstractVector, z::AbstractVector)
+    length(r) == length(z) || throw(ArgumentError("r and z lengths differ."))
+    output = Vector{promote_type(eltype(r), eltype(z))}(undef, 2 * length(r))
+    for i in eachindex(r, z)
+        output[2i - 1] = r[i]
+        output[2i] = z[i]
+    end
+    return output
+end
+
+function unstack_rz(values::AbstractVector)
+    iseven(length(values)) || throw(ArgumentError("Expected interleaved r,z values."))
+    return values[1:2:end], values[2:2:end]
+end
+
+function contour_normals(r::AbstractVector, z::AbstractVector)
+    length(r) == length(z) || throw(ArgumentError("r and z lengths differ."))
+    n = length(r)
+    n >= 2 || throw(ArgumentError("At least two contour points are required."))
+    normals = Matrix{Float64}(undef, n, 2)
+    for i in 1:n
+        left, right = i == 1 ? (1, 2) : i == n ? (n - 1, n) : (i - 1, i + 1)
+        dr = Float64(r[right] - r[left])
+        dz = Float64(z[right] - z[left])
+        magnitude = hypot(dr, dz)
+        magnitude > 0 || error("Degenerate contour tangent at point $i.")
+        normals[i, :] .= (-dz / magnitude, dr / magnitude)
+    end
+    return normals
+end
+
+function normal_covariance(covariance::AbstractMatrix, normals::AbstractMatrix)
+    n = size(normals, 1)
+    size(covariance) == (2n, 2n) ||
+        throw(ArgumentError("Covariance does not match the contour length."))
+    projected = Matrix{Float64}(undef, n, n)
+    for i in 1:n, j in 1:n
+        block = covariance[2i-1:2i, 2j-1:2j]
+        projected[i, j] = dot(view(normals, i, :), block * view(normals, j, :))
+    end
+    return projected
+end
+
+normal_sigmas(covariance, normals) =
+    sqrt.(max.(diag(normal_covariance(covariance, normals)), 0.0))
+
+function relative_position_assessment(
+    J_offset::AbstractMatrix,
+    normals::AbstractMatrix,
+    joint_camera_normal_sigma::AbstractVector,
+    t_mean::AbstractVector,
+)
+    n = size(normals, 1)
+    n > 0 || throw(ArgumentError("At least one contour normal is required."))
+    size(normals, 2) == 2 ||
+        throw(ArgumentError("Contour normals must have two columns."))
+    size(J_offset) == (2n, 1) ||
+        throw(ArgumentError("Offset Jacobian must have one column per contour."))
+    length(joint_camera_normal_sigma) == n ||
+        throw(ArgumentError("Joint-camera normal σ does not match the contour length."))
+    length(t_mean) == 3 ||
+        throw(ArgumentError("Mean translation must have three coordinates."))
+    all(isfinite, J_offset) ||
+        throw(ArgumentError("Offset Jacobian must contain finite values."))
+    all(isfinite, normals) ||
+        throw(ArgumentError("Contour normals must contain finite values."))
+    all(x -> isfinite(x) && x >= 0, joint_camera_normal_sigma) ||
+        throw(ArgumentError("Joint-camera normal σ must be finite and nonnegative."))
+    all(isfinite, t_mean) ||
+        throw(ArgumentError("Mean translation must contain finite values."))
+
+    camera_marker_distance_mm = abs(Float64(t_mean[3]))
+    camera_marker_distance_mm > 0 ||
+        throw(ArgumentError("Camera-marker optical depth must be positive."))
+
+    unit_offset_covariance = J_offset * transpose(J_offset)
+    median_normal_sigma_per_mm_offset =
+        median(normal_sigmas(unit_offset_covariance, normals))
+    median_normal_sigma_per_mm_offset > 0 ||
+        throw(ArgumentError("Offset Jacobian has zero median normal sensitivity."))
+    median_joint_camera_normal_sigma_mm =
+        median(Float64.(joint_camera_normal_sigma))
+    break_even_offset_mm =
+        median_joint_camera_normal_sigma_mm / median_normal_sigma_per_mm_offset
+
+    return (
+        camera_marker_distance_mm=camera_marker_distance_mm,
+        median_normal_sigma_per_mm_offset=median_normal_sigma_per_mm_offset,
+        median_joint_camera_normal_sigma_mm=median_joint_camera_normal_sigma_mm,
+        break_even_offset_mm=break_even_offset_mm,
+        relative_scale_error_per_mm=inv(camera_marker_distance_mm),
+        relative_surface_tension_error_per_mm=2 / camera_marker_distance_mm,
+    )
+end
+
+function block_diagonal_extrinsic(Σ_rvec, Σ_t)
+    Σ = zeros(Float64, 6, 6)
+    Σ[1:3, 1:3] .= Σ_rvec
+    Σ[4:6, 4:6] .= Σ_t
+    return Σ
+end
+
+function rotation_log(R::AbstractMatrix{<:Real})
+    cosine = clamp((tr(R) - 1) / 2, -1.0, 1.0)
+    θ = acos(cosine)
+    vee = Float64[R[3, 2] - R[2, 3], R[1, 3] - R[3, 1], R[2, 1] - R[1, 2]]
+    θ < 1e-8 && return vee ./ 2
+    abs(sin(θ)) > 1e-12 ||
+        error("Cannot compute a stable rotation-vector increment near angle π.")
+    return (θ / (2sin(θ))) .* vee
+end
+
+function summarize_pose_samples(R_samples, t_samples)
+    length(R_samples) == length(t_samples) ||
+        throw(ArgumentError("Rotation and translation sample counts differ."))
+    length(R_samples) >= 2 ||
+        throw(ArgumentError("At least two pose samples are required."))
+
+    R_mean = copy(first(R_samples))
+    for _ in 1:10
+        increments = [
+            rotation_log(transpose(R_mean) * R) for R in R_samples
+        ]
+        mean_increment = vec(mean(reduce(hcat, increments); dims=2))
+        R_mean = _right_perturbed_rotation(R_mean, mean_increment)
+        norm(mean_increment) < 1e-12 && break
+    end
+
+    samples = Matrix{Float64}(undef, length(R_samples), 6)
+    for i in eachindex(R_samples, t_samples)
+        samples[i, 1:3] .=
+            rotation_log(transpose(R_mean) * R_samples[i])
+        samples[i, 4:6] .= Float64.(t_samples[i])
+    end
+    t_mean = vec(mean(samples[:, 4:6]; dims=1))
+    samples[:, 4:6] .-= reshape(t_mean, 1, 3)
+    covariance = Matrix{Float64}(cov(samples; dims=1))
+    return R_mean, t_mean, covariance
+end
+
+function correlation_matrix(covariance)
+    standard_deviations = sqrt.(max.(diag(covariance), 0.0))
+    denominator = standard_deviations * transpose(standard_deviations)
+    return covariance ./ max.(denominator, eps(Float64))
+end
+
+function covariance_terms(jacobians, Σ_intrinsics, Σ_ext_block, Σ_ext_full,
+                          sigma_pix, sigma_pose_offset)
+    Ji, Je, Jp, Jo = jacobians.J_intrinsics, jacobians.J_extrinsics,
+                     jacobians.J_pixels, jacobians.J_offset
+    camera_block = Ji * Σ_intrinsics * transpose(Ji) +
+                   Je * Σ_ext_block * transpose(Je)
+    camera_full = Ji * Σ_intrinsics * transpose(Ji) +
+                  Je * Σ_ext_full * transpose(Je)
+    pixel_term = (sigma_pix^2) .* (Jp * transpose(Jp))
+    offset_term = (sigma_pose_offset^2) .* (Jo * transpose(Jo))
+    return (
+        camera_block=Matrix(Symmetric(camera_block)),
+        camera_full=Matrix(Symmetric(camera_full)),
+        pixel=Matrix(Symmetric(pixel_term)),
+        offset=Matrix(Symmetric(offset_term)),
+        total_block=Matrix(Symmetric(camera_block + pixel_term + offset_term)),
+        total_full=Matrix(Symmetric(camera_full + pixel_term + offset_term)),
+        camera_plus_offset=Matrix(Symmetric(camera_full + offset_term)),
+    )
+end
+
+function sample_inverse_contour(
+    pixels_u, pixels_v, phi, extrinsic_delta, pose_offset, R_mean, t_mean,
+    R_rel, t_rel; plane_coordinate::Real,
+)
+    parameters = vcat(phi, extrinsic_delta, pose_offset)
+    r, z = inverse_project_camtodrop(
+        pixels_u, pixels_v, parameters, R_mean, t_mean, R_rel, t_rel;
+        plane_coordinate,
+    )
+    return stack_rz(r, z)
+end
+
+function print_leading_modes(covariance, r, z; count=5)
+    decomposition = eigen(Symmetric(covariance))
+    order = sortperm(decomposition.values; rev=true)
+    centroid = [mean(r), mean(z)]
+    rigid = zeros(Float64, 2 * length(r), 3)
+    for i in eachindex(r)
+        rigid[2i - 1, 1] = 1
+        rigid[2i, 2] = 1
+        rigid[2i - 1, 3] = -(z[i] - centroid[2])
+        rigid[2i, 3] = r[i] - centroid[1]
+    end
+    Qrigid = Matrix(qr(rigid).Q)[:, 1:3]
+    scale = stack_rz(r .- centroid[1], z .- centroid[2])
+    scale_residual = scale - Qrigid * (transpose(Qrigid) * scale)
+    scale_residual ./= max(norm(scale_residual), eps(Float64))
+    println("\nLeading camera-covariance modes (translation/rotation, scale, shape):")
+    rows = min(count, length(order))
+    for rank in 1:rows
+        index = order[rank]
+        vector = decomposition.vectors[:, index]
+        rigid_fraction = sum(abs2, transpose(Qrigid) * vector)
+        scale_fraction = abs2(dot(scale_residual, vector))
+        shape_fraction = max(0.0, 1 - rigid_fraction - scale_fraction)
+        @printf(
+            "  %d: λ=%.6g  rigid=%.1f%%  scale=%.1f%%  shape=%.1f%%\n",
+            rank, decomposition.values[index], 100 * rigid_fraction,
+            100 * scale_fraction, 100 * shape_fraction,
+        )
+    end
+    return decomposition.values[order], decomposition.vectors[:, order]
 end
