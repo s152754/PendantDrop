@@ -1823,3 +1823,379 @@ function save_extrinsic_uncertainty(result, output_path::String)
         return false
     end
 end
+
+import ForwardDiff
+const Camera = parentmodule(@__MODULE__)
+
+"""Extract a real scalar value to anchor an implicit undistortion solve."""
+_camtodrop_primal(x::ForwardDiff.Dual) = _camtodrop_primal(ForwardDiff.value(x))
+_camtodrop_primal(x::Real) = Float64(x)
+
+"""
+Apply a Rodrigues rotation-vector increment as a right perturbation of `R_mean`.
+
+The increment is expressed in the mean camera rotation's local frame.
+"""
+function _right_perturbed_rotation(R_mean::AbstractMatrix, delta::AbstractVector)
+    length(delta) == 3 || throw(ArgumentError("Rotation increment must have length 3."))
+    θ2 = sum(abs2, delta)
+    T = typeof(θ2)
+    if θ2 < 1e-12
+        a = one(θ2) - θ2 / 6 + θ2^2 / 120
+        b = one(θ2) / 2 - θ2 / 24 + θ2^2 / 720
+    else
+        θ = sqrt(θ2)
+        a = sin(θ) / θ
+        b = (one(θ) - cos(θ)) / θ2
+    end
+    W = T[
+        zero(θ2) -delta[3] delta[2]
+        delta[3] zero(θ2) -delta[1]
+        -delta[2] delta[1] zero(θ2)
+    ]
+    I3 = Matrix{T}(I, 3, 3)
+    return R_mean * (I3 + a .* W + b .* (W * W))
+end
+
+"""
+Return the model-local (r,z) coordinates for fixed pixels.
+
+`parameters` is `[fx, fy, cx, cy, k1, k2, p1, p2, k3,
+δrx, δry, δrz, δtx, δty, δtz, δoffset]`. Rotation increments are right
+perturbations of `R_mean`, matching `extrinsic_covariance`'s
+`R_mean' * R_sample` convention. The relative-pose offset shifts `t_rel` along
+the model plane normal. For dual-number inputs, distortion inversion uses the
+implicit-function derivative evaluated at `reference_parameters`; it does not
+differentiate through the iterative undistortion solver. `reference_pixels`
+anchors the normalized-ray solution when evaluating perturbed pixels.
+"""
+function inverse_project_camtodrop(
+    u::AbstractVector,
+    v::AbstractVector,
+    parameters::AbstractVector,
+    R_mean::AbstractMatrix,
+    t_mean::AbstractVector,
+    R_rel::AbstractMatrix,
+    t_rel::AbstractVector;
+    plane_coordinate::Real = 0.0,
+    reference_parameters::Union{Nothing,AbstractVector} = nothing,
+    reference_pixels::Union{Nothing,AbstractVector} = nothing,
+    iterations::Int = 20,
+)
+    length(u) == length(v) ||
+        throw(ArgumentError("u and v must have the same length."))
+    length(parameters) == 16 ||
+        throw(ArgumentError("parameters must contain 16 values."))
+    length(t_mean) == 3 && length(t_rel) == 3 ||
+        throw(ArgumentError("Camera and relative translations must have length 3."))
+    iterations >= 1 || throw(ArgumentError("iterations must be positive."))
+
+    is_float_input =
+        eltype(parameters) <: AbstractFloat &&
+        eltype(u) <: AbstractFloat &&
+        eltype(v) <: AbstractFloat
+    if is_float_input
+        fx, fy, cx, cy = parameters[1:4]
+        K = [fx 0.0 cx; 0.0 fy cy; 0.0 0.0 1.0]
+        dist = Float64.(parameters[5:9])
+        R = _right_perturbed_rotation(
+            Float64.(R_mean), Float64.(parameters[10:12]),
+        )
+        t = Float64.(t_mean) .+ Float64.(parameters[13:15])
+        R_rel_float = Float64.(R_rel)
+        t_rel_offset = Float64.(t_rel) .+
+                       Float64(parameters[16]) .* R_rel_float[:, 3]
+        r, z, _ = Camera.pixel_to_model(
+            u, v, R, t, K, dist, R_rel_float, t_rel_offset;
+            plane_coordinate=plane_coordinate,
+            iterations=iterations,
+        )
+        return r, z
+    end
+
+    reference_parameters === nothing && throw(ArgumentError(
+        "reference_parameters is required for ForwardDiff inputs.",
+    ))
+    length(reference_parameters) == 16 ||
+        throw(ArgumentError("reference_parameters must contain 16 values."))
+    reference_pixels === nothing || length(reference_pixels) == 2length(u) ||
+        throw(ArgumentError("reference_pixels must contain interleaved u,v values."))
+
+    p0 = Float64.(reference_parameters)
+    fx0, fy0, cx0, cy0 = p0[1:4]
+    dist0 = p0[5:9]
+    R = _right_perturbed_rotation(R_mean, view(parameters, 10:12))
+    t = t_mean .+ view(parameters, 13:15)
+    T = promote_type(eltype(parameters), eltype(u), eltype(v))
+    r = Vector{T}(undef, length(u))
+    z = similar(r)
+    normal = Float64.(R_rel[:, 3])
+    t_relative = t_rel .+ parameters[16] .* normal
+    plane_point = t_relative .+ plane_coordinate .* normal
+    camera_center = -(transpose(R) * t)
+
+    for i in eachindex(u, v)
+        reference_u = reference_pixels === nothing ?
+            _camtodrop_primal(u[i]) : reference_pixels[2i - 1]
+        reference_v = reference_pixels === nothing ?
+            _camtodrop_primal(v[i]) : reference_pixels[2i]
+        xd0 = (reference_u - cx0) / fx0
+        yd0 = (reference_v - cy0) / fy0
+        x0_vec, y0_vec = Camera.undistortion(
+            [xd0], [yd0], dist0; max_iter=iterations, tol=1e-12,
+        )
+        x0, y0 = x0_vec[1], y0_vec[1]
+        Jx = ForwardDiff.jacobian(
+            q -> collect(Camera.distortion(q[1], q[2], dist0)),
+            Float64[x0, y0],
+        )
+        abs(det(Jx)) > eps(Float64) ||
+            throw(ArgumentError("Distortion Jacobian is singular at pixel $i."))
+
+        xd = (u[i] - parameters[3]) / parameters[1]
+        yd = (v[i] - parameters[4]) / parameters[2]
+        d0 = Camera.distortion(x0, y0, dist0)
+        d = Camera.distortion(x0, y0, view(parameters, 5:9))
+        residual = [
+            d[1] - xd - (d0[1] - xd0),
+            d[2] - yd - (d0[2] - yd0),
+        ]
+        x = x0 - (Jx \ residual)[1]
+        y = y0 - (Jx \ residual)[2]
+
+        ray_camera = [x, y, one(x)]
+        ray_marker = transpose(R) * ray_camera
+        denominator = dot(normal, ray_marker)
+        abs(denominator) > 1e-12 ||
+            throw(ArgumentError("Viewing ray is parallel to the droplet plane at pixel $i."))
+        λ = dot(normal, plane_point .- camera_center) / denominator
+        point_marker = camera_center .+ λ .* ray_marker
+        point_model = transpose(R_rel) * (point_marker .- t_relative)
+        r[i] = point_model[1]
+        z[i] = point_model[2]
+    end
+    return r, z
+end
+
+"""
+Forward-project model-local contour coordinates using the same transform order
+as `Model.ForwardModel`. The meridian coordinate is fixed by `plane_coordinate`.
+"""
+function forward_project_camtodrop(
+    r::AbstractVector,
+    z::AbstractVector,
+    parameters::AbstractVector,
+    R_mean::AbstractMatrix,
+    t_mean::AbstractVector,
+    R_rel::AbstractMatrix,
+    t_rel::AbstractVector;
+    plane_coordinate::Real = 0.0,
+)
+    length(r) == length(z) ||
+        throw(ArgumentError("r and z must have the same length."))
+    length(parameters) == 16 ||
+        throw(ArgumentError("parameters must contain 16 values."))
+
+    fx, fy, cx, cy = parameters[1:4]
+    K = [fx 0.0 cx; 0.0 fy cy; 0.0 0.0 1.0]
+    dist = parameters[5:9]
+    R = _right_perturbed_rotation(R_mean, view(parameters, 10:12))
+    t = t_mean .+ view(parameters, 13:15)
+    t_relative = t_rel .+ parameters[16] .* R_rel[:, 3]
+
+    if eltype(parameters) <: AbstractFloat &&
+       eltype(r) <: AbstractFloat && eltype(z) <: AbstractFloat
+        return Camera.project_model_to_image(
+            Float64.(r), Float64.(z),
+            fill(Float64(plane_coordinate), length(r)),
+            Float64.(R), Float64.(t), Float64.(K), Float64.(dist),
+            Float64.(R_rel), Float64.(t_relative),
+        )
+    end
+
+    R_total = R * R_rel
+    t_total = R * t_relative + t
+    T = promote_type(eltype(r), eltype(z), eltype(parameters))
+    X = vcat(
+        reshape(T.(r), 1, :),
+        reshape(T.(z), 1, :),
+        fill(one(parameters[1]) * plane_coordinate, 1, length(r)),
+    )
+    X_camera = R_total * X .+ reshape(t_total, 3, 1)
+    x = X_camera[1, :] ./ X_camera[3, :]
+    y = X_camera[2, :] ./ X_camera[3, :]
+    xd, yd = Camera.distortion(x, y, dist)
+    return fx .* xd .+ cx, fy .* yd .+ cy, X_camera[3, :]
+end
+
+"""
+Calculate inverse-projection Jacobians with respect to the nine intrinsics,
+six extrinsic parameters, the relative-pose normal offset, and the pixel data.
+Undistortion derivatives use the implicit function theorem.
+"""
+function camtodrop_jacobians(
+    u::AbstractVector,
+    v::AbstractVector,
+    intrinsics::AbstractVector,
+    R_mean::AbstractMatrix,
+    t_mean::AbstractVector,
+    R_rel::AbstractMatrix,
+    t_rel::AbstractVector;
+    plane_coordinate::Real = 0.0,
+)
+    length(intrinsics) == 9 ||
+        throw(ArgumentError("intrinsics must follow [fx,fy,cx,cy,k1,k2,p1,p2,k3]."))
+    base = vcat(Float64.(intrinsics), zeros(6), 0.0)
+    reference = copy(base)
+    n = length(u)
+
+    flatten_rz(r, z) = reduce(vcat, ([r[i], z[i]] for i in eachindex(r, z)))
+    inverse_parameters(p, pixels) = begin
+        r, z = inverse_project_camtodrop(
+            view(pixels, 1:2:2n), view(pixels, 2:2:2n), p,
+            R_mean, t_mean, R_rel, t_rel;
+            plane_coordinate=plane_coordinate,
+            reference_parameters=reference,
+            reference_pixels=pixels0,
+        )
+        flatten_rz(r, z)
+    end
+    pixels0 = reduce(vcat, ([u[i], v[i]] for i in eachindex(u, v)))
+    y0 = inverse_parameters(base, pixels0)
+
+    J_intrinsics = ForwardDiff.jacobian(
+        intrinsic_sample ->
+            inverse_parameters(vcat(intrinsic_sample, zeros(6), 0.0), pixels0),
+        Float64.(intrinsics),
+    )
+    J_extrinsics = ForwardDiff.jacobian(
+        extrinsic_sample ->
+            inverse_parameters(vcat(Float64.(intrinsics), extrinsic_sample, 0.0), pixels0),
+        zeros(6),
+    )
+    J_offset = ForwardDiff.jacobian(
+        offset_sample ->
+            inverse_parameters(vcat(Float64.(intrinsics), zeros(6), offset_sample), pixels0),
+        [0.0],
+    )
+    J_pixels = ForwardDiff.jacobian(
+        pixel_sample -> inverse_parameters(base, pixel_sample),
+        pixels0,
+    )
+
+    return (coordinates=y0, J_intrinsics=J_intrinsics,
+            J_extrinsics=J_extrinsics, J_offset=J_offset,
+            J_pixels=J_pixels, parameter_order=(
+                "fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3",
+                "δrx_right_rad", "δry_right_rad", "δrz_right_rad",
+                "δtx_mm", "δty_mm", "δtz_mm", "δoffset_normal_mm",
+            ))
+end
+
+"""
+Return Jacobian of undistorted normalized coordinates with respect to the
+five OpenCV distortion coefficients, using `∂x/∂φ = -(∂d/∂x)⁻¹∂d/∂φ`.
+"""
+function undistortion_implicit_parameter_jacobian(
+    xd::Real,
+    yd::Real,
+    dist_coeffs::AbstractVector{<:Real},
+)
+    length(dist_coeffs) >= 5 ||
+        throw(ArgumentError("At least five OpenCV distortion coefficients are required."))
+    dist = Float64.(dist_coeffs[1:5])
+    x_values, y_values = Camera.undistortion(
+        [Float64(xd)], [Float64(yd)], dist; max_iter=40, tol=1e-13,
+    )
+    x0 = Float64[x_values[1], y_values[1]]
+    Jx = ForwardDiff.jacobian(
+        x -> collect(Camera.distortion(x[1], x[2], dist)), x0,
+    )
+    Jφ = ForwardDiff.jacobian(
+        coefficients -> collect(Camera.distortion(x0[1], x0[2], coefficients)),
+        dist,
+    )
+    return -(Jx \ Jφ)
+end
+
+"""
+Sample a multivariate normal using a positive-semidefinite covariance matrix.
+"""
+function sample_gaussian(rng::AbstractRNG, mean_vector::AbstractVector,
+                         covariance::AbstractMatrix)
+    n = length(mean_vector)
+    size(covariance) == (n, n) ||
+        throw(ArgumentError("Covariance shape does not match the mean vector."))
+    isapprox(covariance, transpose(covariance); atol=1e-10, rtol=1e-8) ||
+        throw(ArgumentError("Covariance matrix must be symmetric."))
+    decomposition = eigen(Symmetric(Float64.(covariance)))
+    tolerance = 1e-10 * max(maximum(abs, decomposition.values), 1.0)
+    minimum(decomposition.values) >= -tolerance ||
+        throw(ArgumentError("Covariance matrix must be positive semidefinite."))
+    factor = decomposition.vectors * Diagonal(sqrt.(max.(decomposition.values, 0.0)))
+    return Float64.(mean_vector) .+ factor * randn(rng, n)
+end
+
+"""
+Run one solvePnP bootstrap draw per intrinsic-parameter sample, matching
+`bootstrap_extrinsics`'s target geometry, corner perturbations, and solver.
+"""
+function joint_intrinsic_extrinsic_bootstrap(
+    corners_px::AbstractMatrix{<:Real},
+    corner_covariances::AbstractVector{<:AbstractMatrix},
+    intrinsic_samples::AbstractMatrix{<:Real},
+    marker_length_mm::Real;
+    seed::Int,
+)
+    size(corners_px) == (4, 2) ||
+        throw(ArgumentError("corners_px must be a 4×2 matrix."))
+    length(corner_covariances) == 4 ||
+        throw(ArgumentError("Exactly four corner covariance matrices are required."))
+    size(intrinsic_samples, 2) == 9 ||
+        throw(ArgumentError("intrinsic_samples must have nine columns."))
+    marker_length_mm > 0 ||
+        throw(ArgumentError("marker_length_mm must be positive."))
+
+    py"""
+import cv2, numpy as np
+
+corners = np.asarray($corners_px, dtype=np.float64).reshape(4, 2)
+corner_covariances = np.asarray($corner_covariances, dtype=np.float64).reshape(4, 2, 2)
+samples = np.asarray($intrinsic_samples, dtype=np.float64)
+marker_length = float($marker_length_mm)
+rng = np.random.default_rng(int($seed))
+obj_points = np.array([
+    [-marker_length/2,  marker_length/2, 0],
+    [ marker_length/2,  marker_length/2, 0],
+    [ marker_length/2, -marker_length/2, 0],
+    [-marker_length/2, -marker_length/2, 0],
+], dtype=np.float64)
+rotations, translations = [], []
+for i, phi in enumerate(samples):
+    K = np.array([
+        [phi[0], 0.0, phi[2]],
+        [0.0, phi[1], phi[3]],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    dist = np.asarray(phi[4:9], dtype=np.float64)
+    noisy_corners = corners.copy()
+    for corner_index in range(4):
+        noisy_corners[corner_index] += rng.multivariate_normal(
+            np.zeros(2), corner_covariances[corner_index], check_valid="raise")
+    success, rvec, tvec = cv2.solvePnP(obj_points, noisy_corners, K, dist)
+    if not success:
+        raise RuntimeError(f"solvePnP failed for joint bootstrap sample {i + 1}")
+    R, _ = cv2.Rodrigues(rvec)
+    rotations.append(R.tolist())
+    translations.append(tvec.reshape(-1).tolist())
+result = (rotations, translations)
+"""
+    R_raw, t_raw = py"result"
+    R_samples = Matrix{Float64}[
+        Matrix{Float64}(R_raw[i, :, :]) for i in axes(R_raw, 1)
+    ]
+    t_samples = Vector{Float64}[
+        Float64.(vec(t_raw[i, :])) for i in axes(t_raw, 1)
+    ]
+    return R_samples, t_samples
+end
