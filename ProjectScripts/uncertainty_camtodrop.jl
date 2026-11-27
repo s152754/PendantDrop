@@ -32,6 +32,11 @@ const CORNER_RESULTS_FILE = joinpath(
 )
 const OUTPUT_DIR = joinpath(EXTRINSIC_DIR, "camtodrop_uncertainty")
 const OUTPUT_FILE = joinpath(OUTPUT_DIR, "uncertainty_camtodrop.jld2")
+const OBSERVED_OUTPUT_FILE = joinpath(
+    OUTPUT_DIR, "uncertainty_camtodrop_observed.jld2",
+)
+const CONTOUR_SOURCE = :virtual
+const EDGE_DATA_FILE = joinpath(PROJECT_ROOT, "docs", "example_edge_data.jld2")
 
 const SIGMA_PIX = 0.3                 # px; isotropic contour-pixel noise
 const SIGMA_POSE_OFFSET = 0.0         # mm; translation along the model-plane normal
@@ -56,26 +61,6 @@ const PLANE_COORDINATE_MM = 0.0
 
 const CAMERA = Model.Camera
 const UQ = CAMERA.IntrinsicUncertainty
-
-function require_keys(data, keys, path)
-    missing = filter(key -> !haskey(data, key), keys)
-    isempty(missing) ||
-        error("$path is missing required keys: $(join(missing, ", ")).")
-end
-
-function resample_curve(values::AbstractVector{<:Real}, count::Int)
-    length(values) >= 2 || error("Physical contour has fewer than two points.")
-    count >= 2 || throw(ArgumentError("Contour sample count must be at least two."))
-    locations = range(1.0, Float64(length(values)); length=count)
-    output = Vector{Float64}(undef, count)
-    for (i, location) in enumerate(locations)
-        left = floor(Int, location)
-        right = min(left + 1, length(values))
-        fraction = location - left
-        output[i] = (1 - fraction) * values[left] + fraction * values[right]
-    end
-    return output
-end
 
 # DEPRECATED: unused as of the uncertainty reorganization; candidate for deletion.
 #=
@@ -114,91 +99,9 @@ function sample_covariance_from_pose_cache(R_mean, t_mean)
 end
 =#
 
-function load_or_fit_aruco_corners(K, dist)
-    cached_paths = (
-        joinpath(EXTRINSIC_DIR, "aruco_corner_results_$(ZOOM_LEVEL).jld2"),
-        CORNER_RESULTS_FILE,
-        joinpath(
-            EXTRINSIC_DIR,
-            "extrinsic_bootstrap_$(ZOOM_LEVEL)_fit_corner_N1000.jld2",
-        ),
-    )
-    for path in cached_paths
-        isfile(path) || continue
-        cached = JLD2.load(path)
-        haskey(cached, "Σ_corners") || continue
-        corners_key = haskey(cached, "fitted_corners_px") ? "fitted_corners_px" :
-                      haskey(cached, "corners_px") ? "corners_px" : nothing
-        corners_key === nothing && continue
-        haskey(cached, "marker_ids") || path != CORNER_RESULTS_FILE ||
-            error("$path is missing marker_ids.")
-        @info "Loading cached ArUco corners and covariance" path
-        return Matrix{Float64}(cached[corners_key]),
-               Matrix{Float64}[Matrix{Float64}(Σ) for Σ in cached["Σ_corners"]]
-    end
-
-    isfile(ARUCO_IMAGE_FILE) || error("ArUco image not found: $ARUCO_IMAGE_FILE")
-    corners_px, marker_ids = UQ.detect_aruco_corners(ARUCO_IMAGE_FILE, K, dist)
-    size(corners_px) == (4, 2) ||
-        error("Expected four ArUco corners, received $(size(corners_px)).")
-
-    image = FileIO.load(ARUCO_IMAGE_FILE)
-    intensity = 1 .- Float64.(Gray.(image))
-    interpolant = linear_interpolation(
-        (1:size(intensity, 1), 1:size(intensity, 2)),
-        intensity;
-        extrapolation_bc=NaN,
-    )
-    fitted_corners = copy(corners_px)
-    corner_results = Vector{Any}(undef, 4)
-    for i in 1:4
-        corner = corners_px[i, :] .+ 1.0
-        previous = corners_px[mod1(i - 1, 4), :] .+ 1.0
-        following = corners_px[mod1(i + 1, 4), :] .+ 1.0
-        edge_a = previous .- corner
-        edge_b = following .- corner
-        length_a, length_b = norm(edge_a), norm(edge_b)
-        shortest = min(length_a, length_b)
-        max_distance = 0.4 * shortest
-        max_distance > 13.0 ||
-            error("ArUco corner $i cannot support the configured edge profiles.")
-        result = UQ.fit_corner(
-            interpolant,
-            corner,
-            edge_a ./ length_a,
-            edge_b ./ length_b;
-            profile_positions=collect(range(8.0, max_distance; length=6)),
-            half=min(40.0, shortest / 12),
-        )
-        result === nothing && error("Could not fit ArUco corner $i.")
-        corner_results[i] = result
-        fitted_corners[i, :] .+= result.q
-    end
-    Σ_corners = Matrix{Float64}[Matrix{Float64}(result.Σ) for result in corner_results]
-    mkpath(dirname(CORNER_RESULTS_FILE))
-    JLD2.jldsave(
-        CORNER_RESULTS_FILE;
-        corner_results,
-        opencv_corners_px=corners_px,
-        fitted_corners_px=fitted_corners,
-        Σ_corners,
-        marker_ids,
-        zoom_level=ZOOM_LEVEL,
-    )
-    @info "Saved regenerated ArUco observations and corner covariance" CORNER_RESULTS_FILE
-    return fitted_corners, Σ_corners
-end
-
-function make_normal_band(r, z, normals, σ)
-    upper = [Float64[r[i] + σ[i] * normals[i, 1],
-                     z[i] + σ[i] * normals[i, 2]] for i in eachindex(r)]
-    lower = [Float64[r[i] - σ[i] * normals[i, 1],
-                     z[i] - σ[i] * normals[i, 2]] for i in eachindex(r)]
-    polygon = vcat(upper, reverse(lower))
-    return Shape(first.(polygon), last.(polygon))
-end
-
 function main()
+    CONTOUR_SOURCE in (:virtual, :observed) ||
+        error("CONTOUR_SOURCE must be :virtual or :observed.")
     SIGMA_PIX >= 0 || error("SIGMA_PIX must be nonnegative.")
     SIGMA_POSE_OFFSET >= 0 || error("SIGMA_POSE_OFFSET must be nonnegative.")
     if ASSUMED_OFFSET_ACCURACY_MM !== nothing
@@ -219,15 +122,26 @@ function main()
     intrinsics_file = JLD2.load(INTRINSIC_FILE)
     covariance_file = JLD2.load(INTRINSIC_COVARIANCE_FILE)
     extrinsics_file = JLD2.load(EXTRINSIC_UNCERTAINTY_FILE)
-    require_keys(intrinsics_file, ("camera_matrix", "dist_coeffs"), INTRINSIC_FILE)
-    require_keys(covariance_file, ("Σ_φ",), INTRINSIC_COVARIANCE_FILE)
-    require_keys(
+    UQ.require_keys(intrinsics_file, ("camera_matrix", "dist_coeffs"), INTRINSIC_FILE)
+    UQ.require_keys(covariance_file, ("Σ_φ",), INTRINSIC_COVARIANCE_FILE)
+    UQ.require_keys(
         extrinsics_file, ("rvec_mean", "t_mean", "Σ_rvec", "Σ_t"),
         EXTRINSIC_UNCERTAINTY_FILE,
     )
 
     K = Matrix{Float64}(intrinsics_file["camera_matrix"])
     dist = vec(Float64.(intrinsics_file["dist_coeffs"]))[1:5]
+    edge_data = if CONTOUR_SOURCE === :observed
+        loaded_edge_data = UQ.load_edge_uncertainty_data(
+            EDGE_DATA_FILE;
+            image_root=PROJECT_ROOT,
+            expected_image_file=ARUCO_IMAGE_FILE,
+        )
+        println("Edge uncertainty description (1σ): ", loaded_edge_data.sigma_description)
+        loaded_edge_data
+    else
+        nothing
+    end
     intrinsics = Float64[
         K[1, 1], K[2, 2], K[1, 3], K[2, 3], dist[1], dist[2],
         dist[3], dist[4], dist[5],
@@ -237,7 +151,13 @@ function main()
         error("Σ_φ must be 9×9 in [fx,fy,cx,cy,k1,k2,p1,p2,k3] order.")
     legacy_Σ_rvec = Matrix{Float64}(extrinsics_file["Σ_rvec"])
     legacy_Σ_t = Matrix{Float64}(extrinsics_file["Σ_t"])
-    fitted_corners, Σ_corners = load_or_fit_aruco_corners(K, dist)
+    fitted_corners, Σ_corners = UQ.load_or_fit_aruco_corners(
+        K, dist;
+        extrinsic_dir=EXTRINSIC_DIR,
+        zoom_level=ZOOM_LEVEL,
+        corner_results_file=CORNER_RESULTS_FILE,
+        aruco_image_file=ARUCO_IMAGE_FILE,
+    )
     baseline_intrinsic_samples =
         repeat(reshape(intrinsics, 1, 9), N_BASELINE_EXT_MC, 1)
     baseline_R_samples, baseline_t_samples =
@@ -267,37 +187,50 @@ function main()
     display(round.(UQ.correlation_matrix(legacy_Σ_t); digits=3))
     # Bootstrap increments are right perturbations: R_sample = R_mean * exp(δrvec).
 
-    physical_r, physical_z, _, hits = Model.PD_fn(
-        log.([GAMMA_MN_PER_M, R_APEX_MM]),
-        R_NEEDLE_MM;
-        n_points=N_MODEL_POINTS,
-        r_tol=1e-12,
-        h_tol=1e-12,
-        hits_max=2,
-    )
-    isempty(physical_r) && error("PD_fn returned an empty contour.")
-    hits > 0 || @warn "PD_fn detected no needle-radius crossings" hits
-    contour_r = resample_curve(physical_r, N_VIRTUAL_POINTS)
-    contour_z = resample_curve(physical_z, N_VIRTUAL_POINTS)
     R_rel = CAMERA.getRrel_fn(THETA_X_DEG, THETA_Y_DEG, THETA_Z_DEG)
-    base_parameters = vcat(intrinsics, zeros(6), 0.0)
-
-    virtual_u, virtual_v, _ = UQ.forward_project_camtodrop(
-        contour_r, contour_z, base_parameters,
-        R_mean, t_mean, R_rel, T_REL_MM;
-        plane_coordinate=PLANE_COORDINATE_MM,
-    )
-    recovered_r, recovered_z = UQ.inverse_project_camtodrop(
-        virtual_u, virtual_v, base_parameters,
-        R_mean, t_mean, R_rel, T_REL_MM;
-        plane_coordinate=PLANE_COORDINATE_MM,
-    )
-    roundtrip_errors = hypot.(recovered_r .- contour_r, recovered_z .- contour_z)
-    max_roundtrip_error = maximum(roundtrip_errors)
-    println("Maximum forward/inverse round-trip error: $(max_roundtrip_error) mm")
+    if CONTOUR_SOURCE === :virtual
+        physical_r, physical_z, _, hits = Model.PD_fn(
+            log.([GAMMA_MN_PER_M, R_APEX_MM]),
+            R_NEEDLE_MM;
+            n_points=N_MODEL_POINTS,
+            r_tol=1e-12,
+            h_tol=1e-12,
+            hits_max=2,
+        )
+        isempty(physical_r) && error("PD_fn returned an empty contour.")
+        hits > 0 || @warn "PD_fn detected no needle-radius crossings" hits
+        contour_r = UQ.resample_curve(physical_r, N_VIRTUAL_POINTS)
+        contour_z = UQ.resample_curve(physical_z, N_VIRTUAL_POINTS)
+        base_parameters = vcat(intrinsics, zeros(6), 0.0)
+        virtual_u, virtual_v, _ = UQ.forward_project_camtodrop(
+            contour_r, contour_z, base_parameters,
+            R_mean, t_mean, R_rel, T_REL_MM;
+            plane_coordinate=PLANE_COORDINATE_MM,
+        )
+        recovered_r, recovered_z = UQ.inverse_project_camtodrop(
+            virtual_u, virtual_v, base_parameters,
+            R_mean, t_mean, R_rel, T_REL_MM;
+            plane_coordinate=PLANE_COORDINATE_MM,
+        )
+        roundtrip_errors = hypot.(recovered_r .- contour_r, recovered_z .- contour_z)
+        max_roundtrip_error = maximum(roundtrip_errors)
+        println("Maximum forward/inverse round-trip error: $(max_roundtrip_error) mm")
+        contour_u, contour_v = virtual_u, virtual_v
+    else
+        edge_data === nothing && error("Observed edge data was not loaded.")
+        contour_u = edge_data.u .- 1.0
+        contour_v = edge_data.v .- 1.0
+        println(
+            "Observed contour mode: skipping the virtual-contour comparison and round-trip check.",
+        )
+        println(
+            "The isotropic SIGMA_PIX term is not included in the observed total; edge uncertainty comes from the supplied file.",
+        )
+    end
+    contour_count = length(contour_u)
 
     jacobians = UQ.camtodrop_jacobians(
-        virtual_u, virtual_v, intrinsics,
+        contour_u, contour_v, intrinsics,
         R_mean, t_mean, R_rel, T_REL_MM;
         plane_coordinate=PLANE_COORDINATE_MM,
     )
@@ -307,11 +240,18 @@ function main()
     )
     normals = UQ.contour_normals(jacobians.coordinates[1:2:end],
                                  jacobians.coordinates[2:2:end])
+    if CONTOUR_SOURCE === :observed
+        UQ.validate_observed_contour_order(
+            jacobians.coordinates[1:2:end],
+            jacobians.coordinates[2:2:end],
+            R_NEEDLE_MM,
+        )
+    end
     independent_normal_sigma =
         UQ.normal_sigmas(terms.camera_full + terms.offset, normals)
 
     rng = MersenneTwister(SEED)
-    linear_samples = Matrix{Float64}(undef, N_LINEAR_MC, 2N_VIRTUAL_POINTS)
+    linear_samples = Matrix{Float64}(undef, N_LINEAR_MC, 2contour_count)
     independent_parameter_samples = Matrix{Float64}(undef, N_LINEAR_MC, 15)
     Σ_independent = zeros(Float64, 15, 15)
     Σ_independent[1:9, 1:9] .= Σ_intrinsics
@@ -322,7 +262,7 @@ function main()
         independent_parameter_samples[sample_index, :] .= sampled_parameters
         offset_sample = SIGMA_POSE_OFFSET * randn(rng)
         linear_samples[sample_index, :] .= UQ.sample_inverse_contour(
-            virtual_u, virtual_v, sampled_parameters[1:9],
+            contour_u, contour_v, sampled_parameters[1:9],
             sampled_parameters[10:15], offset_sample,
             R_mean, t_mean, R_rel, T_REL_MM,
             plane_coordinate=PLANE_COORDINATE_MM,
@@ -370,8 +310,8 @@ function main()
         seed=SEED + 2,
     )
     joint_pose_increments = Matrix{Float64}(undef, N_JOINT_MC, 6)
-    joint_camera_samples = Matrix{Float64}(undef, N_JOINT_MC, 2 * N_VIRTUAL_POINTS)
-    joint_samples = Matrix{Float64}(undef, N_JOINT_MC, 2N_VIRTUAL_POINTS)
+    joint_camera_samples = Matrix{Float64}(undef, N_JOINT_MC, 2contour_count)
+    joint_samples = Matrix{Float64}(undef, N_JOINT_MC, 2contour_count)
     joint_apex_radius = Vector{Float64}(undef, N_JOINT_MC)
     for i in 1:N_JOINT_MC
         rotation_delta = UQ.rotation_log(transpose(R_mean) * R_joint[i])
@@ -380,13 +320,13 @@ function main()
         joint_pose_increments[i, 4:6] .= translation_delta
         offset_sample = SIGMA_POSE_OFFSET * randn(rng_intrinsic)
         joint_camera_samples[i, :] .= UQ.sample_inverse_contour(
-            virtual_u, virtual_v, intrinsic_samples[i, :],
+            contour_u, contour_v, intrinsic_samples[i, :],
             vcat(rotation_delta, translation_delta), 0.0,
             R_mean, t_mean, R_rel, T_REL_MM,
             plane_coordinate=PLANE_COORDINATE_MM,
         )
         joint_samples[i, :] .= UQ.sample_inverse_contour(
-            virtual_u, virtual_v, intrinsic_samples[i, :],
+            contour_u, contour_v, intrinsic_samples[i, :],
             vcat(rotation_delta, translation_delta), offset_sample,
             R_mean, t_mean, R_rel, T_REL_MM,
             plane_coordinate=PLANE_COORDINATE_MM,
@@ -403,7 +343,7 @@ function main()
     pixel_normal_sigma = UQ.normal_sigmas(terms.pixel, normals)
     shared_corner_shift_assessment = UQ.shared_corner_shift_sensitivity(
         fitted_corners, K, dist, MARKER_LENGTH_MM,
-        virtual_u, virtual_v, intrinsics, R_rel, T_REL_MM,
+        contour_u, contour_v, intrinsics, R_rel, T_REL_MM,
         joint_camera_normal_sigma;
         plane_coordinate=PLANE_COORDINATE_MM,
     )
@@ -501,134 +441,219 @@ function main()
         println("  No substantial median normal-uncertainty inflation is indicated.")
 
     mkpath(OUTPUT_DIR)
-    plot_linear_mc = plot(
-        1:N_VIRTUAL_POINTS, linear_normal_sigma;
-        label="Linearized", linewidth=2, xlabel="Contour point",
-        ylabel="Normal-direction σ [mm]",
-        title="Linearized vs Monte Carlo uncertainty",
-    )
-    plot!(plot_linear_mc, 1:N_VIRTUAL_POINTS, mc_normal_sigma;
-          label="Independent Monte Carlo", linewidth=2, linestyle=:dash)
-    plot!(plot_linear_mc, 1:N_VIRTUAL_POINTS, joint_normal_sigma;
-          label="Joint bootstrap camera", linewidth=2, linestyle=:dot)
-    plot!(plot_linear_mc, 1:N_VIRTUAL_POINTS, joint_total_normal_sigma;
-          label="Joint bootstrap total (camera + pixel)", linewidth=2, linestyle=:solid)
-    plot!(plot_linear_mc, 1:N_VIRTUAL_POINTS, joint_camera_normal_sigma;
-          label="Joint camera term", linewidth=2, linestyle=:dashdot)
-    plot!(plot_linear_mc, 1:N_VIRTUAL_POINTS, pixel_normal_sigma;
-          label="Pixel noise (σ = $(SIGMA_PIX) px)", linewidth=2, linestyle=:dash)
-    savefig(plot_linear_mc, joinpath(OUTPUT_DIR, "linear_vs_monte_carlo.png"))
+    if CONTOUR_SOURCE === :virtual
+        plot_linear_mc = plot(
+            1:contour_count, linear_normal_sigma;
+            label="Linearized", linewidth=2, xlabel="Contour point",
+            ylabel="Normal-direction σ [mm]",
+            title="Linearized vs Monte Carlo uncertainty",
+        )
+        plot!(plot_linear_mc, 1:contour_count, mc_normal_sigma;
+              label="Independent Monte Carlo", linewidth=2, linestyle=:dash)
+        plot!(plot_linear_mc, 1:contour_count, joint_normal_sigma;
+              label="Joint bootstrap camera", linewidth=2, linestyle=:dot)
+        plot!(plot_linear_mc, 1:contour_count, joint_total_normal_sigma;
+              label="Joint bootstrap total (camera + pixel)", linewidth=2, linestyle=:solid)
+        plot!(plot_linear_mc, 1:contour_count, joint_camera_normal_sigma;
+              label="Joint camera term", linewidth=2, linestyle=:dashdot)
+        plot!(plot_linear_mc, 1:contour_count, pixel_normal_sigma;
+              label="Pixel noise (σ = $(SIGMA_PIX) px)", linewidth=2, linestyle=:dash)
+        savefig(plot_linear_mc, joinpath(OUTPUT_DIR, "linear_vs_monte_carlo.png"))
 
-    plot_bands = plot(
-        jacobians.coordinates[1:2:end], jacobians.coordinates[2:2:end];
-        color=:black, linewidth=2, label="Virtual contour",
-        xlabel="r [mm]", ylabel="z [mm]",
-        title="Normal-direction uncertainty bands",
-        aspect_ratio=:equal,
-    )
-    plot!(plot_bands, make_normal_band(
-        jacobians.coordinates[1:2:end], jacobians.coordinates[2:2:end],
-        normals, independent_normal_sigma,
-    ); color=:blue, fillalpha=0.16, linealpha=0, label="Independent, 1σ")
-    plot!(plot_bands, make_normal_band(
-        jacobians.coordinates[1:2:end], jacobians.coordinates[2:2:end],
-        normals, joint_normal_sigma,
-    ); color=:orange, fillalpha=0.16, linealpha=0, label="Joint bootstrap, 1σ")
-    savefig(plot_bands, joinpath(OUTPUT_DIR, "normal_uncertainty_bands.png"))
+        plot_bands = plot(
+            jacobians.coordinates[1:2:end], jacobians.coordinates[2:2:end];
+            color=:black, linewidth=2, label="Virtual contour",
+            xlabel="r [mm]", ylabel="z [mm]",
+            title="Normal-direction uncertainty bands",
+            aspect_ratio=:equal,
+        )
+        plot!(plot_bands, UQ.make_normal_band(
+            jacobians.coordinates[1:2:end], jacobians.coordinates[2:2:end],
+            normals, independent_normal_sigma,
+        ); color=:blue, fillalpha=0.16, linealpha=0, label="Independent, 1σ")
+        plot!(plot_bands, UQ.make_normal_band(
+            jacobians.coordinates[1:2:end], jacobians.coordinates[2:2:end],
+            normals, joint_normal_sigma,
+        ); color=:orange, fillalpha=0.16, linealpha=0, label="Joint bootstrap, 1σ")
+        savefig(plot_bands, joinpath(OUTPUT_DIR, "normal_uncertainty_bands.png"))
+    end
 
     Σ_normal_camera = UQ.normal_covariance(terms.camera_full, normals)
     Σ_normal_pixel = UQ.normal_covariance(terms.pixel, normals)
     Σ_normal_total = UQ.normal_covariance(terms.total_full, normals)
     Σ_normal_joint = UQ.normal_covariance(Σ_joint_mc, normals)
-    metadata = Dict(
-        "parameter_order" => collect(jacobians.parameter_order),
-        "intrinsic_order" => [
-            "fx_px", "fy_px", "cx_px", "cy_px", "k1", "k2", "p1", "p2", "k3",
-        ],
-        "extrinsic_order" => [
-            "δrx_right_rad", "δry_right_rad", "δrz_right_rad",
-            "δtx_mm", "δty_mm", "δtz_mm",
-        ],
-        "units" => Dict("contour" => "mm", "pixel" => "px",
-                        "rotation" => "rad", "covariance" => "mm^2"),
-        "frame_definition" =>
-            "Model-local meridian (r,z), third coordinate plane_coordinate=0; mm.",
-        "extrinsic_rotation_perturbation" =>
-            "Right perturbation: R_sample = R_mean * exp(δrvec); δrvec = log(R_mean' * R_sample).",
-        "independence_assumption" =>
-            "Intrinsic calibration and extrinsic pose uncertainty are independent. Both independent and joint calculations use extrinsic uncertainty generated from the same fitted corner locations and fitted corner covariances.",
-        "extrinsic_noise_basis" =>
-            "Each fitted corner is perturbed independently using its fitted 2×2 covariance; nominal covariance and joint bootstrap use the same centers and covariance matrices.",
-        "virtual_plane_assumption" =>
-            "The PD_fn contour is forward-projected with its third model coordinate fixed at zero so it lies on the inverse-projection plane.",
-        "extrinsic_sample_source" => extrinsic_sample_file,
-        "corner_results_file" => CORNER_RESULTS_FILE,
-        "baseline_extrinsic_bootstrap_samples" => N_BASELINE_EXT_MC,
-        "joint_bootstrap_samples" => N_JOINT_MC,
-        "baseline_to_stored_extrinsic_sd_ratio" =>
-            baseline_sd ./ max.(stored_sd, eps(Float64)),
-        "seed" => SEED,
-        "sigma_pix_px" => SIGMA_PIX,
-        "sigma_pose_offset_mm" => SIGMA_POSE_OFFSET,
-        "assumed_offset_accuracy_mm" => ASSUMED_OFFSET_ACCURACY_MM,
-        "relative_position_assessment" => position_assessment,
-        "roundtrip_max_error_mm" => max_roundtrip_error,
-    )
-    JLD2.jldsave(
-        OUTPUT_FILE;
-        virtual_r=jacobians.coordinates[1:2:end],
-        virtual_z=jacobians.coordinates[2:2:end],
-        virtual_u=Float64.(virtual_u),
-        virtual_v=Float64.(virtual_v),
-        roundtrip_errors,
-        Σ_intrinsics,
-        Σ_rvec,
-        Σ_t,
-        rvec_mean=UQ.rotation_log(R_mean),
-        t_mean,
-        Σ_ext_block,
-        Σ_ext_full,
-        Σ_ext_legacy_blockdiag=legacy_Σ_ext,
-        baseline_to_stored_extrinsic_sd_ratio=
-            baseline_sd ./ max.(stored_sd, eps(Float64)),
-        Σ_camera_independent_block=terms.camera_block,
-        Σ_camera_independent_full_ext=terms.camera_full,
-        Σ_pixel=terms.pixel,
-        Σ_pose_offset=terms.offset,
-        Σ_total_independent_block=terms.total_block,
-        Σ_total_independent_full_ext=terms.total_full,
-        Σ_linear_monte_carlo=Σ_linear_mc,
-        Σ_camera_joint_reference=Σ_joint_camera_mc,
-        Σ_pixel_joint_reference=terms.pixel,
-        Σ_total_joint_reference=Σ_total_joint,
-        Σ_joint_monte_carlo=Σ_joint_mc,
-        Σ_normal_camera=Σ_normal_camera,
-        Σ_normal_pixel=Σ_normal_pixel,
-        Σ_normal_total=Σ_normal_total,
-        Σ_normal_joint=Σ_normal_joint,
-        normal_sigma_independent=independent_normal_sigma,
-        normal_sigma_linearized=linear_normal_sigma,
-        normal_sigma_monte_carlo=mc_normal_sigma,
-        normal_sigma_joint=joint_normal_sigma,
-        normal_sigma_joint_camera=joint_camera_normal_sigma,
-        normal_sigma_joint_total=joint_total_normal_sigma,
-        normal_sigma_pixel=pixel_normal_sigma,
-        normal_sigma_ratio=normal_ratio,
-        joint_apex_radius_mm=joint_apex_radius,
-        independent_apex_radius_mm=independent_apex_radius,
-        metadata,
-        shared_corner_shift_assessment,
-        fitted_aruco_corners_px=fitted_corners,
-        Σ_corners,
-        baseline_R_samples,
-        baseline_t_samples,
-        independent_parameter_samples,
-        joint_intrinsic_samples=intrinsic_samples,
-        joint_pose_increments,
-        independent_contour_samples=linear_samples,
-        joint_contour_samples=joint_samples,
-    )
-    println("\nSaved virtual contour and covariance results: $OUTPUT_FILE")
+    if CONTOUR_SOURCE === :observed
+        edge_pixel_covariance = UQ.edge_normal_pixel_covariance(
+            edge_data.u, edge_data.v, edge_data.sigma_n_px, edge_data.correlation,
+        )
+        J_pixels = jacobians.J_pixels
+        edge_model_covariance =
+            J_pixels * edge_pixel_covariance * transpose(J_pixels)
+        Σ_camera_observed = UQ.normal_covariance(Σ_joint_camera_mc, normals)
+        Σ_edge_observed = UQ.normal_covariance(edge_model_covariance, normals)
+        Σ_total_observed = Matrix(Symmetric(Σ_camera_observed + Σ_edge_observed))
+        sigma_camera_observed =
+            sqrt.(max.(diag(Σ_camera_observed), 0.0))
+        sigma_edge_observed = sqrt.(max.(diag(Σ_edge_observed), 0.0))
+        sigma_total_observed = sqrt.(max.(diag(Σ_total_observed), 0.0))
+        total_normal_correlation = UQ.correlation_matrix(Σ_total_observed)
+
+        plot_edge_sigma = plot(
+            1:contour_count, sigma_camera_observed;
+            label="Camera", linewidth=2, xlabel="Contour point (apex to needle)",
+            ylabel="Normal-direction σ [mm]",
+            title="Observed edge uncertainty",
+        )
+        plot!(plot_edge_sigma, 1:contour_count, sigma_edge_observed;
+              label="Edge", linewidth=2, linestyle=:dash)
+        plot!(plot_edge_sigma, 1:contour_count, sigma_total_observed;
+              label="Total", linewidth=2, linestyle=:dot)
+        savefig(
+            plot_edge_sigma,
+            joinpath(OUTPUT_DIR, "observed_edge_sigma_components.png"),
+        )
+        plot_edge_correlation = heatmap(
+            total_normal_correlation;
+            clims=(-1, 1), xlabel="Contour point",
+            ylabel="Contour point",
+            title="Observed total normal-covariance correlation",
+            colorbar_title="Correlation",
+        )
+        savefig(
+            plot_edge_correlation,
+            joinpath(OUTPUT_DIR, "observed_edge_total_correlation.png"),
+        )
+    end
+    metadata = if CONTOUR_SOURCE === :virtual
+        Dict(
+            "parameter_order" => collect(jacobians.parameter_order),
+            "intrinsic_order" => [
+                "fx_px", "fy_px", "cx_px", "cy_px", "k1", "k2", "p1", "p2", "k3",
+            ],
+            "extrinsic_order" => [
+                "δrx_right_rad", "δry_right_rad", "δrz_right_rad",
+                "δtx_mm", "δty_mm", "δtz_mm",
+            ],
+            "units" => Dict("contour" => "mm", "pixel" => "px",
+                            "rotation" => "rad", "covariance" => "mm^2"),
+            "frame_definition" =>
+                "Model-local meridian (r,z), third coordinate plane_coordinate=0; mm.",
+            "extrinsic_rotation_perturbation" =>
+                "Right perturbation: R_sample = R_mean * exp(δrvec); δrvec = log(R_mean' * R_sample).",
+            "independence_assumption" =>
+                "Intrinsic calibration and extrinsic pose uncertainty are independent. Both independent and joint calculations use extrinsic uncertainty generated from the same fitted corner locations and fitted corner covariances.",
+            "extrinsic_noise_basis" =>
+                "Each fitted corner is perturbed independently using its fitted 2×2 covariance; nominal covariance and joint bootstrap use the same centers and covariance matrices.",
+            "virtual_plane_assumption" =>
+                "The PD_fn contour is forward-projected with its third model coordinate fixed at zero so it lies on the inverse-projection plane.",
+            "extrinsic_sample_source" => extrinsic_sample_file,
+            "corner_results_file" => CORNER_RESULTS_FILE,
+            "baseline_extrinsic_bootstrap_samples" => N_BASELINE_EXT_MC,
+            "joint_bootstrap_samples" => N_JOINT_MC,
+            "baseline_to_stored_extrinsic_sd_ratio" =>
+                baseline_sd ./ max.(stored_sd, eps(Float64)),
+            "seed" => SEED,
+            "sigma_pix_px" => SIGMA_PIX,
+            "sigma_pose_offset_mm" => SIGMA_POSE_OFFSET,
+            "assumed_offset_accuracy_mm" => ASSUMED_OFFSET_ACCURACY_MM,
+            "relative_position_assessment" => position_assessment,
+            "roundtrip_max_error_mm" => max_roundtrip_error,
+        )
+    else
+        Dict(
+            "contour_source" => "observed",
+            "image_file" => edge_data.image_file,
+            "pixel_coordinate_convention" =>
+                "1-based Julia pixel centers; converted to OpenCV coordinates for projection.",
+            "contour_order" =>
+                "Right-hand image side, apex to needle; needle edges excluded.",
+            "sigma_description" => edge_data.sigma_description,
+            "plane_coordinate_mm" => PLANE_COORDINATE_MM,
+            "roundtrip_check" => "Skipped for observed contours.",
+            "correlation_source" => edge_data.correlation_source,
+        )
+    end
+    if CONTOUR_SOURCE === :virtual
+        JLD2.jldsave(
+            OUTPUT_FILE;
+            virtual_r=jacobians.coordinates[1:2:end],
+            virtual_z=jacobians.coordinates[2:2:end],
+            virtual_u=Float64.(virtual_u),
+            virtual_v=Float64.(virtual_v),
+            roundtrip_errors,
+            Σ_intrinsics,
+            Σ_rvec,
+            Σ_t,
+            rvec_mean=UQ.rotation_log(R_mean),
+            t_mean,
+            Σ_ext_block,
+            Σ_ext_full,
+            Σ_ext_legacy_blockdiag=legacy_Σ_ext,
+            baseline_to_stored_extrinsic_sd_ratio=
+                baseline_sd ./ max.(stored_sd, eps(Float64)),
+            Σ_camera_independent_block=terms.camera_block,
+            Σ_camera_independent_full_ext=terms.camera_full,
+            Σ_pixel=terms.pixel,
+            Σ_pose_offset=terms.offset,
+            Σ_total_independent_block=terms.total_block,
+            Σ_total_independent_full_ext=terms.total_full,
+            Σ_linear_monte_carlo=Σ_linear_mc,
+            Σ_camera_joint_reference=Σ_joint_camera_mc,
+            Σ_pixel_joint_reference=terms.pixel,
+            Σ_total_joint_reference=Σ_total_joint,
+            Σ_joint_monte_carlo=Σ_joint_mc,
+            Σ_normal_camera=Σ_normal_camera,
+            Σ_normal_pixel=Σ_normal_pixel,
+            Σ_normal_total=Σ_normal_total,
+            Σ_normal_joint=Σ_normal_joint,
+            normal_sigma_independent=independent_normal_sigma,
+            normal_sigma_linearized=linear_normal_sigma,
+            normal_sigma_monte_carlo=mc_normal_sigma,
+            normal_sigma_joint=joint_normal_sigma,
+            normal_sigma_joint_camera=joint_camera_normal_sigma,
+            normal_sigma_joint_total=joint_total_normal_sigma,
+            normal_sigma_pixel=pixel_normal_sigma,
+            normal_sigma_ratio=normal_ratio,
+            joint_apex_radius_mm=joint_apex_radius,
+            independent_apex_radius_mm=independent_apex_radius,
+            metadata,
+            shared_corner_shift_assessment,
+            fitted_aruco_corners_px=fitted_corners,
+            Σ_corners,
+            baseline_R_samples,
+            baseline_t_samples,
+            independent_parameter_samples,
+            joint_intrinsic_samples=intrinsic_samples,
+            joint_pose_increments,
+            independent_contour_samples=linear_samples,
+            joint_contour_samples=joint_samples,
+        )
+        println("\nSaved virtual contour and covariance results: $OUTPUT_FILE")
+    else
+        JLD2.jldsave(
+            OBSERVED_OUTPUT_FILE;
+            contour_r_mm=jacobians.coordinates[1:2:end],
+            contour_z_mm=jacobians.coordinates[2:2:end],
+            observed_u_px=edge_data.u,
+            observed_v_px=edge_data.v,
+            Σ_camera_normal=Σ_camera_observed,
+            Σ_edge_normal=Σ_edge_observed,
+            Σ_total_normal=Σ_total_observed,
+            sigma_camera_normal_mm=sigma_camera_observed,
+            sigma_edge_normal_mm=sigma_edge_observed,
+            sigma_total_normal_mm=sigma_total_observed,
+            total_normal_correlation,
+            edge_pixel_covariance_px2=edge_pixel_covariance,
+            edge_model_covariance_mm2=edge_model_covariance,
+            Σ_intrinsics,
+            Σ_ext_full,
+            R_mean,
+            t_mean,
+            metadata,
+        )
+        println("\nSaved observed contour and covariance results: $OBSERVED_OUTPUT_FILE")
+        println("Saved observed-edge figures in: $OUTPUT_DIR")
+    end
     println("Saved plots in: $OUTPUT_DIR")
 end
 

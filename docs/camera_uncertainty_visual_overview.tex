@@ -31,6 +31,13 @@ pendant-drop contour with the drop assumed to lie in the marker plane
 results and writes the PDFs in \texttt{docs/figures/}; it does not calibrate,
 bootstrap, or run Monte Carlo.
 
+\noindent\textit{Implementation pointers:} intrinsic bootstrap
+\texttt{src/camera\_uncertainties.jl:374}; ArUco corner loading and fitting
+\texttt{src/camera\_uncertainties.jl:668}; inverse projection and its Jacobian
+\texttt{src/camera\_uncertainties.jl:1003, 1173}; normal covariance
+\texttt{src/camera\_uncertainties.jl:1340, 1356}; relative-position analysis
+\texttt{src/camera\_uncertainties.jl:1621}.
+
 \section{Intrinsic parameters}
 
 The reference intrinsics come from the zoom5 checkerboard calibration in
