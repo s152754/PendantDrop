@@ -198,15 +198,6 @@ function make_normal_band(r, z, normals, σ)
     return Shape(first.(polygon), last.(polygon))
 end
 
-function apex_radius_measure(r, z)
-    indices = sortperm(abs.(r))[1:min(16, length(r))]
-    length(indices) >= 4 || return NaN
-    design = hcat(ones(length(indices)), Float64.(r[indices]).^2)
-    coefficient = design \ Float64.(z[indices])
-    curvature = abs(coefficient[2])
-    return curvature > eps(Float64) ? 1 / (2curvature) : Inf
-end
-
 function main()
     SIGMA_PIX >= 0 || error("SIGMA_PIX must be nonnegative.")
     SIGMA_POSE_OFFSET >= 0 || error("SIGMA_POSE_OFFSET must be nonnegative.")
@@ -321,12 +312,14 @@ function main()
 
     rng = MersenneTwister(SEED)
     linear_samples = Matrix{Float64}(undef, N_LINEAR_MC, 2N_VIRTUAL_POINTS)
+    independent_parameter_samples = Matrix{Float64}(undef, N_LINEAR_MC, 15)
     Σ_independent = zeros(Float64, 15, 15)
     Σ_independent[1:9, 1:9] .= Σ_intrinsics
     Σ_independent[10:15, 10:15] .= Σ_ext_full
     parameter_mean = vcat(intrinsics, zeros(6))
     for sample_index in 1:N_LINEAR_MC
         sampled_parameters = UQ.sample_gaussian(rng, parameter_mean, Σ_independent)
+        independent_parameter_samples[sample_index, :] .= sampled_parameters
         offset_sample = SIGMA_POSE_OFFSET * randn(rng)
         linear_samples[sample_index, :] .= UQ.sample_inverse_contour(
             virtual_u, virtual_v, sampled_parameters[1:9],
@@ -376,12 +369,15 @@ function main()
         fitted_corners, Σ_corners, intrinsic_samples, MARKER_LENGTH_MM;
         seed=SEED + 2,
     )
+    joint_pose_increments = Matrix{Float64}(undef, N_JOINT_MC, 6)
     joint_camera_samples = Matrix{Float64}(undef, N_JOINT_MC, 2 * N_VIRTUAL_POINTS)
     joint_samples = Matrix{Float64}(undef, N_JOINT_MC, 2N_VIRTUAL_POINTS)
     joint_apex_radius = Vector{Float64}(undef, N_JOINT_MC)
     for i in 1:N_JOINT_MC
         rotation_delta = UQ.rotation_log(transpose(R_mean) * R_joint[i])
         translation_delta = t_joint[i] .- t_mean
+        joint_pose_increments[i, 1:3] .= rotation_delta
+        joint_pose_increments[i, 4:6] .= translation_delta
         offset_sample = SIGMA_POSE_OFFSET * randn(rng_intrinsic)
         joint_camera_samples[i, :] .= UQ.sample_inverse_contour(
             virtual_u, virtual_v, intrinsic_samples[i, :],
@@ -396,7 +392,7 @@ function main()
             plane_coordinate=PLANE_COORDINATE_MM,
         )
         r_sample, z_sample = UQ.unstack_rz(view(joint_samples, i, :))
-        joint_apex_radius[i] = apex_radius_measure(r_sample, z_sample)
+        joint_apex_radius[i] = UQ.apex_radius_measure(r_sample, z_sample)
     end
     Σ_joint_camera_mc = Matrix{Float64}(cov(joint_camera_samples; dims=1))
     Σ_joint_mc = Matrix{Float64}(cov(joint_samples; dims=1))
@@ -405,6 +401,27 @@ function main()
     joint_camera_normal_sigma = UQ.normal_sigmas(Σ_joint_camera_mc, normals)
     joint_total_normal_sigma = UQ.normal_sigmas(Σ_total_joint, normals)
     pixel_normal_sigma = UQ.normal_sigmas(terms.pixel, normals)
+    shared_corner_shift_assessment = UQ.shared_corner_shift_sensitivity(
+        fitted_corners, K, dist, MARKER_LENGTH_MM,
+        virtual_u, virtual_v, intrinsics, R_rel, T_REL_MM,
+        joint_camera_normal_sigma;
+        plane_coordinate=PLANE_COORDINATE_MM,
+    )
+    println("\nShared-corner deterministic sensitivity:")
+    @printf(
+        "  Median joint camera normal σ = %.2f µm.\n",
+        shared_corner_shift_assessment.median_joint_camera_sigma_um,
+    )
+    for case in shared_corner_shift_assessment.cases
+        @printf(
+            "  %s: Δrotation=(%.3f, %.3f, %.3f) mrad; Δtranslation=(%.2f, %.2f, %.2f) µm; median |normal displacement|=%.2f µm; Δapex radius=%.2f µm.\n",
+            case.label,
+            case.rotation_change_mrad...,
+            case.translation_change_um...,
+            case.median_abs_normal_displacement_um,
+            case.apex_radius_change_um,
+        )
+    end
 
     position_assessment = nothing
     if SIGMA_POSE_OFFSET == 0.0
@@ -467,7 +484,7 @@ function main()
     )
 
     independent_apex_radius =
-        [apex_radius_measure(view(linear_samples, i, 1:2:size(linear_samples, 2)),
+        [UQ.apex_radius_measure(view(linear_samples, i, 1:2:size(linear_samples, 2)),
                              view(linear_samples, i, 2:2:size(linear_samples, 2)))
          for i in 1:N_LINEAR_MC]
     size_ratio = std(joint_apex_radius) / max(std(independent_apex_radius), eps(Float64))
@@ -600,10 +617,16 @@ function main()
         joint_apex_radius_mm=joint_apex_radius,
         independent_apex_radius_mm=independent_apex_radius,
         metadata,
+        shared_corner_shift_assessment,
         fitted_aruco_corners_px=fitted_corners,
         Σ_corners,
         baseline_R_samples,
         baseline_t_samples,
+        independent_parameter_samples,
+        joint_intrinsic_samples=intrinsic_samples,
+        joint_pose_increments,
+        independent_contour_samples=linear_samples,
+        joint_contour_samples=joint_samples,
     )
     println("\nSaved virtual contour and covariance results: $OUTPUT_FILE")
     println("Saved plots in: $OUTPUT_DIR")

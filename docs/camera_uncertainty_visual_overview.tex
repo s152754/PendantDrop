@@ -1,0 +1,571 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{siunitx}
+\usepackage{placeins}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\sisetup{detect-all}
+\graphicspath{{figures/}}
+
+\title{Camera-Parameter Uncertainty: Zoom5 Visual Overview}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+This note follows the current zoom5 camera-to-droplet analysis. It uses the
+saved checkerboard bootstrap, the saved ArUco corner fit, and the virtual
+pendant-drop contour with the drop assumed to lie in the marker plane
+(\(\delta=0\)). The plotting program
+\texttt{ProjectScripts/figures\_camera\_uncertainty.jl} reads those saved
+results and writes the PDFs in \texttt{docs/figures/}; it does not calibrate,
+bootstrap, or run Monte Carlo.
+
+\section{Intrinsic parameters}
+
+The reference intrinsics come from the zoom5 checkerboard calibration in
+\texttt{camint\_all.jld2}. It contains 49 calibration images with 117
+detected checkerboard corners per image. The camera model has four pinhole
+parameters and five distortion coefficients,
+\[
+  \boldsymbol{\phi}
+  = (f_x,f_y,c_x,c_y,k_1,k_2,p_1,p_2,k_3)^T.
+\]
+For each observed checkerboard point, the code subtracts the point projected
+by the fitted calibration from the observed image coordinate. Pooling the
+resulting 5733 two-dimensional residuals gives the residual covariance
+\[
+  \Sigma_{\mathrm{corner}}
+  = \operatorname{cov}
+    \begin{pmatrix}e_x\\e_y\end{pmatrix}
+  \simeq
+  \begin{pmatrix}
+    6.646 & -0.361\\
+    -0.361 & 3.936
+  \end{pmatrix}\ {\rm px}^2.
+\]
+The off-diagonal entry retains the measured x--y residual correlation; this
+is a pooled covariance, not a separate covariance estimated for every
+checkerboard corner.
+
+The cached 500-draw bootstrap perturbs each detected checkerboard corner
+independently with noise from
+\(\mathcal{N}(0,\Sigma_{\mathrm{corner}})\), then recalibrates the camera.
+The sample covariance of the resulting parameter vectors is
+\[
+  \Sigma_{\phi}
+  = \frac{1}{499}\sum_{b=1}^{500}
+    (\boldsymbol{\phi}^{(b)}-\bar{\boldsymbol{\phi}})
+    (\boldsymbol{\phi}^{(b)}-\bar{\boldsymbol{\phi}})^T.
+\]
+The bootstrap cache stores its residuals, \(\Sigma_{\mathrm{corner}}\),
+500-by-9 `samples`, the bootstrap mean vector \(\bar{\phi}\), and covariance
+\(\Sigma_\phi\). The bootstrap implementation does
+not set an explicit random seed; this overview uses the existing cache and
+does not regenerate it. The separate analysis seed controls the later
+camera-to-droplet draws, not this cached calibration bootstrap.
+
+Figure~\ref{fig:intrinsic-sigma} reports relative standard deviations for
+\(f_x,f_y,c_x,c_y\) and absolute coefficient standard deviations for
+\(k_1,\ldots,k_3\). Figures~\ref{fig:intrinsic-correlation} and
+\ref{fig:intrinsic-pairs} show parameter dependence: diagonal entries in the
+heatmap are one, while the scatter panels expose the shape and sign of the
+strongest bootstrap correlations.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{A1_intrinsic_marginal_sigma.pdf}
+  \caption{Marginal intrinsic standard deviations from \(\Sigma_\phi\).
+  Focal lengths and principal points are shown as relative standard
+  deviations in percent; distortion coefficients are shown as absolute
+  standard deviations.}
+  \label{fig:intrinsic-sigma}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.88\textwidth]{A2_intrinsic_correlation.pdf}
+  \caption{Annotated correlation matrix of the cached 500-draw intrinsic
+  bootstrap. Red and blue indicate positive and negative correlation;
+  stronger color means larger absolute correlation.}
+  \label{fig:intrinsic-correlation}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{A3_intrinsic_pair_scatter.pdf}
+  \caption{Bootstrap scatter for the four most strongly correlated intrinsic
+  pairs: \(f_x\)--\(f_y\), \(k_2\)--\(k_3\), \(k_1\)--\(k_2\), and
+  \(k_1\)--\(k_3\). Focal and principal-point axes use relative deviations;
+  distortion axes use absolute coefficient deviations.}
+  \label{fig:intrinsic-pairs}
+\end{figure}
+
+\FloatBarrier
+\section{Extrinsic parameters from the ArUco marker}
+
+The analysis uses one zoom5 marker image and the fitted corners saved in
+\texttt{aruco\_corner\_results\_zoom5\_camtodrop.jld2}. For each detected
+OpenCV corner, \texttt{fit\_corner} samples six intensity profiles along
+each of the two adjoining edges, starting 8 pixels from the corner. A
+sigmoid is fitted to each profile; its center estimates the local edge
+position. The edge positions are then regressed against distance along that
+edge. If \(X=[\boldsymbol{1}\ \ s]\) is the line design matrix and \(e\) its
+residual vector, the code estimates the residual variance as
+\[
+  \hat{s}^{\,2} = \frac{e^T e}{m-2},
+  \qquad
+  \widehat{\operatorname{cov}}(a,b)
+  = \hat{s}^{\,2}(X^TX)^{-1}.
+\]
+Only the fitted intercept variance,
+\(\widehat{\operatorname{var}}(a)
+=\hat{s}^{\,2}[(X^TX)^{-1}]_{11}\), is propagated for each edge; the fitted
+slopes are treated as fixed in the corner-intersection covariance.
+
+For the two edge tangents \(t_1,t_2\), normals \(n_1,n_2\), fitted slopes
+\(b_1,b_2\), and edge intercepts \(a_1,a_2\), the implementation forms
+\[
+  A =
+  \begin{pmatrix}
+    (n_1-b_1t_1)^T\\
+    (n_2-b_2t_2)^T
+  \end{pmatrix},
+  \qquad
+  q=A^{-1}\begin{pmatrix}a_1\\a_2\end{pmatrix},
+\]
+and returns the corner-correction covariance
+\[
+  \Sigma_q
+  = A^{-1}
+    \begin{pmatrix}
+      \operatorname{var}(a_1)&0\\
+      0&\operatorname{var}(a_2)
+    \end{pmatrix}
+    A^{-T}.
+\]
+Thus, each saved \(2\times2\) covariance describes the x/y uncertainty of
+one fitted correction relative to its OpenCV corner. The calculation
+assumes the two edge-intercept errors are independent; the four corner
+covariances are also sampled independently by the later pose bootstrap.
+
+The fixed-intrinsics pose bootstrap holds the nominal camera matrix and
+distortion fixed, perturbs each of the four fitted corners using its own
+saved \(2\times2\) covariance, and runs solvePnP for 1000 draws. The marker
+side length is taken as exactly \(\SI{10}{\milli\metre}\). The pose mean is
+summarized on the rotation manifold; its six-dimensional samples are
+\[
+  \boldsymbol{\eta}_i =
+  \left(
+    \log(R_{\rm mean}^T R_i),\ t_i-t_{\rm mean}
+  \right),
+  \qquad
+  \Sigma_{\rm ext}=\operatorname{cov}(\boldsymbol{\eta}).
+\]
+The full pose covariance \(\Sigma_{\rm ext}\) is saved; rotations are right-perturbation
+radians and translations are millimetres. The analysis output also stores
+the 1000 fixed-intrinsics rotations and translations themselves.
+
+Figure~\ref{fig:aruco-corners} shows the source image, fitted corners, and
+the covariance ellipses. The ellipses are enlarged 20 times for visibility;
+their orientation and relative axis lengths come from the fitted
+covariances, but their displayed size is not the physical one. Figures
+\ref{fig:pose-sigma} and \ref{fig:pose-correlation} summarize the fixed
+intrinsics pose bootstrap.
+
+\subsection{Corner-noise assumptions}
+
+The table gives the saved per-corner covariance summaries. “Previous” and
+“next” refer to the marker-corner order; the angles are the acute angles
+between the ellipse major axis and each adjoining, unoriented edge direction.
+\begin{table}[htbp]
+  \centering
+  \small
+  \begin{tabular}{c c c c c c}
+    \toprule
+    Corner & \(\sigma_x\) [px] & \(\sigma_y\) [px] & \(\rho_{xy}\) &
+    Major--previous & Major--next \\
+    \midrule
+    1 & 0.823 & 1.569 & \(+0.038\) & \(0.95^\circ\) & \(89.03^\circ\) \\
+    2 & 1.144 & 1.478 & \(-0.017\) & \(87.48^\circ\) & \(2.12^\circ\) \\
+    3 & 1.050 & 0.355 & \(-0.008\) & \(89.95^\circ\) & \(0.18^\circ\) \\
+    4 & 1.279 & 0.449 & \(-0.015\) & \(0.01^\circ\) & \(89.71^\circ\) \\
+    \bottomrule
+  \end{tabular}
+  \caption{Marginal standard deviations, within-corner x--y correlation, and
+  major-axis orientation of the saved 2-by-2 corner-fit covariances.}
+  \label{tab:corner-covariance}
+\end{table}
+
+A corner is the intersection of two fitted edge lines, so independent errors
+in the two line offsets are transformed by the line-intersection geometry
+into an x--y covariance; non-axis-aligned edges can therefore produce an
+off-diagonal term. Here the marker edges are nearly aligned with the pixel
+axes, and all four measured correlations are small, but the full covariance
+matrices are retained.
+
+Figure~\ref{fig:corner-noise-pixels} shows 500 reproducible perturbations per
+corner, sampled for plotting only with a fixed seed. The 1\(\sigma\) and
+2\(\sigma\) ellipses are contours of Mahalanobis radius 1 and 2; every panel
+uses the same pixel scale and marks the two incident edge directions.
+
+Both pose-sampling paths use each corner's full \(2\times2\) covariance:
+the fixed-intrinsics bootstrap applies the multivariate draw to each
+corner, and the joint loop does the same for every paired intrinsic sample.
+In particular, the sampled noise is not formed from the diagonal standard
+deviations alone.
+
+Both \texttt{Camera\_extrinsics.jl} and
+\texttt{uncertainty\_camtodrop.jl} use six equally spaced profile centers per
+edge, from 8 pixels to \(0.4\) times the shortest adjacent edge; each profile
+extends \(\min(40,\text{shortest edge}/12)\) pixels to either side of the
+edge. For the saved image, the ranges from the two endpoints of each edge
+are:
+\begin{center}
+  \small
+  \begin{tabular}{c c c c}
+    \toprule
+    Marker edge & Length [px] & From first endpoint [px] &
+    From second endpoint [px] \\
+    \midrule
+    1--2 & 1284.1 & corner 1: 8--504.0 & corner 2: 8--506.4 \\
+    2--3 & 1266.0 & corner 2: 8--506.4 & corner 3: 8--506.4 \\
+    3--4 & 1275.0 & corner 3: 8--506.4 & corner 4: 8--504.0 \\
+    4--1 & 1260.1 & corner 4: 8--504.0 & corner 1: 8--504.0 \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+These windows do not overlap: neighboring endpoint fits leave gaps of about
+250--274 pixels along the shared edge. Given independent local pixel-fit
+noise, using separate windows supports treating the random fit errors as
+independent. It does not rule out common systematic errors across the
+corners.
+
+Figure~\ref{fig:corner-correlation} displays the \(8\times8\) model
+correlation matrix in \((x_1,y_1,\ldots,x_4,y_4)\) order. Its diagonal
+\(2\times2\) blocks are the four fitted within-corner covariances; its
+off-diagonal blocks are zero because the current model assumes independence
+between corners. Correlations estimated from repeated stationary-marker
+images could be compared directly with this matrix: compare the diagonal
+blocks with the saved per-corner covariances and the empirical
+off-diagonal blocks with zero, after accounting for uncertainty and any
+residual whole-image motion.
+
+The current treatment covers random fit noise: two edge-intercept variances
+are propagated into each corner covariance, and each corner is sampled
+independently. It does not model errors shared by all corners, such as blur,
+illumination changes, edge-placement bias, or ink spread. A repeated set of
+images of the same stationary marker could estimate cross-corner covariance:
+after registering frames and separating any whole-image pose motion, form
+the eight-component residual vector of all four corners per image and
+estimate its \(8\times8\) covariance. Its off-diagonal \(2\times2\) blocks
+would quantify correlated motion between corners. The data folder currently
+contains only one zoom5 marker image, \texttt{data/test\_droplets/zoom5.JPG};
+there are no repeated stationary-marker images to analyze.
+
+For a deterministic sensitivity check, the pose is solved once from the
+unshifted fitted corners and again after applying the indicated shift to all
+four corners. The table reports right-rotation changes, camera-frame
+translation changes (including \(t_z\)), median absolute normal displacement
+of the same virtual contour, and the change in its apex-radius measure. No
+Monte Carlo draws are added. The comparison scale is the existing median
+joint-camera normal standard deviation, \(6.02\,\mu\mathrm{m}\).
+\begin{table}[htbp]
+  \centering
+  \small
+  \begin{tabular}{l c c c c c}
+    \toprule
+    Case & \(\Delta\boldsymbol{\theta}\) [mrad] &
+    \(\Delta\boldsymbol{t}\) [\(\mu\)m] &
+    Median \(|\Delta n|\) [\(\mu\)m] &
+    \(\Delta R_{\rm apex}\) [\(\mu\)m] &
+    Camera \(\sigma\) \\
+    \midrule
+    a: \(+0.1\) px in x & \((-0.001,-0.002,0.000)\) &
+    \((0.79,0.00,0.00)\) & 0.73 & \(-2.70\) & \(0.12\times\) \\
+    b: \(+0.1\) px in y & \((-0.001,0.000,0.000)\) &
+    \((0.00,0.79,-0.01)\) & 0.31 & \(+0.03\) & \(0.05\times\) \\
+    c: \(0.1\) px outward & \((0.002,-0.002,0.000)\) &
+    \((-0.86,0.07,-4.51)\) & 0.73 & \(+3.01\) & \(0.12\times\) \\
+    \bottomrule
+  \end{tabular}
+  \caption{Deterministic pose and contour response to shared corner shifts.
+  Translation components are \((t_x,t_y,t_z)\); “outward” shifts each corner
+  radially from the four-corner centroid, making the marker appear larger.}
+  \label{tab:shared-corner-sensitivity}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.88\textwidth]{B1_aruco_corner_uncertainty.pdf}
+  \caption{Zoom5 ArUco marker crop with the four fitted corners and their
+  \(2\times2\) covariance ellipses. Each unit-covariance ellipse is enlarged
+  by a factor of 20; this is a display enlargement, not a claim that the
+  fitted corner uncertainty is 20 times larger. The lime arrows indicate the
+  directions of the fitted marker edges.}
+  \label{fig:aruco-corners}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\textwidth]{B4_corner_noise_in_pixels.pdf}
+  \caption{Corner-fit perturbations in pixel coordinates. Each panel shows
+  500 fixed-seed draws from that corner's full \(2\times2\) covariance, the
+  1\(\sigma\) and 2\(\sigma\) Mahalanobis ellipses, the two incident marker
+  edge directions, and \(\sigma_x,\sigma_y,\rho_{xy}\). All panels use equal
+  aspect ratio and identical axis limits. The random seed is used only for
+  plotting and does not change saved analysis results.}
+  \label{fig:corner-noise-pixels}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth]{B5_corner_correlation_matrix.pdf}
+  \caption{Correlation matrix of all eight corner coordinates in the model.
+  The outlined diagonal blocks are the within-corner correlations; the
+  zero off-diagonal blocks encode the independence assumption between
+  corners.}
+  \label{fig:corner-correlation}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.78\textwidth]{E1_shared_corner_systematic_sensitivity.pdf}
+  \caption{Median absolute normal displacement of the virtual contour from
+  the three deterministic shared-corner shifts. The dashed line marks the
+  median joint-camera normal \(\sigma\) for comparison; all three shifts are
+  below that scale.}
+  \label{fig:shared-corner-sensitivity}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.9\textwidth]{B2_pose_marginal_sigma.pdf}
+  \caption{Marginal standard deviations from the full fixed-intrinsics pose
+  covariance. Right-rotation components are expressed in milliradians and
+  translations in micrometres.}
+  \label{fig:pose-sigma}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.66\textwidth]{B3_pose_correlation.pdf}
+  \caption{Correlation matrix of the six-dimensional fixed-intrinsics pose
+  covariance. The separator distinguishes rotational from translational
+  components; off-diagonal terms within and across these groups are retained.}
+  \label{fig:pose-correlation}
+\end{figure}
+
+\FloatBarrier
+\section{Propagation assuming independence}
+
+Let \(\boldsymbol{p}=(\boldsymbol{\phi},\boldsymbol{\eta})\) contain the
+nine intrinsic parameters and six pose increments. The independent model
+sets their cross-covariance to zero:
+\[
+  \Sigma_{\rm ind} =
+  \begin{pmatrix}
+    \Sigma_\phi & 0\\
+    0 & \Sigma_{\rm ext}
+  \end{pmatrix}.
+\]
+For the contour output \(x=(r_1,z_1,\ldots,r_N,z_N)\), linearization gives
+\[
+  \Sigma_{x,\rm ind}
+  =J_{\rm ind}\Sigma_{\rm ind}J_{\rm ind}^T
+  =J_\phi\Sigma_\phi J_\phi^T
+   +J_\eta\Sigma_{\rm ext}J_\eta^T.
+\]
+The image-pixel contribution is tracked separately as
+\(\Sigma_{\rm pix}=\sigma_{\rm pix}^2J_{\rm pix}J_{\rm pix}^T\), with the
+placeholder \(\sigma_{\rm pix}=0.3\) px. The 500-draw independent Monte
+Carlo check samples the same block-diagonal 15-parameter Gaussian and sends
+each draw through the nonlinear inverse projection. Its median normal
+standard deviation is \(\SI{28.43}{\micro\metre}\), close to the
+linearized \(\SI{28.50}{\micro\metre}\).
+
+The right panel of Figure~\ref{fig:joint-correlation} is this independent
+parameter model. Its intrinsic--pose cross-block is zero by construction;
+the intrinsic--intrinsic and pose--pose blocks still contain their measured
+correlations.
+
+\FloatBarrier
+\section{Joint propagation}
+
+For the joint calculation, 2000 intrinsic vectors are drawn from the
+Gaussian defined by the nominal intrinsics and \(\Sigma_\phi\). Each vector
+is paired, by row, with one set of independently perturbed ArUco corners.
+solvePnP is rerun using that draw's focal lengths, principal point, and
+distortion coefficients. The resulting pose increment is stored as
+\[
+  \boldsymbol{\eta}_i =
+  \left(\log(R_{\rm mean}^T R_i),\ t_i-t_{\rm mean}\right).
+\]
+The saved `joint_intrinsic_samples` and `joint_pose_increments` therefore
+preserve the actual pairing. The sample covariance of their concatenation
+provides the left-panel 15-by-15 joint correlation matrix in
+Figure~\ref{fig:joint-correlation}. The independent and joint matrices are
+shown side by side; black rules separate intrinsic and pose blocks.
+
+Changing the focal length changes the marker's predicted image size, and
+solvePnP responds by changing its estimated depth. These changes can move
+together so that the ratio of focal length to camera-marker distance, which
+controls projected scale, changes less than either parameter alone. In this
+run, \(\rho(f_x,\delta t_z)=0.647\) and
+\(\rho(f_y,\delta t_z)=0.649\). The strongest intrinsic--pose correlations
+are \(\rho(c_y,\delta t_y)=-0.983\) and
+\(\rho(c_x,\delta t_x)=-0.976\); they are included in Figure~\ref{fig:joint-pairs}.
+These are correlations induced by the specified solvePnP procedure, not
+shared checkerboard and marker image noise: the two corner-noise sources
+remain independent in this model.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{C1_C2_joint_vs_independent_correlation.pdf}
+  \caption{Side-by-side 15-by-15 parameter correlation matrices. Left:
+  paired joint draws. Right: the independent model with zero
+  intrinsic--pose cross-correlation. The top-left blocks are intrinsic
+  parameters, the bottom-right blocks are right-pose increments, and the
+  black separators mark their boundary.}
+  \label{fig:joint-correlation}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{C3_intrinsic_pose_coupling.pdf}
+  \caption{Independent parameter draws (gray) overlaid with joint paired
+  draws (orange) for the six strongest intrinsic--pose correlations.
+  \(f_x\)--\(\delta t_z\) is included among them
+  (\(\rho=0.647\)); principal-point/translation pairs show stronger
+  coupling. Focal lengths and principal points are plotted as relative
+  deviations, distortion as absolute coefficient deviations, rotations in
+  milliradians, and translations in micrometres.}
+  \label{fig:joint-pairs}
+\end{figure}
+
+\FloatBarrier
+\section{Effect on the droplet contour}
+
+The analysis generates a virtual \texttt{PD\_fn} pendant-drop contour with
+100 resampled points and projects it through the nominal zoom5 camera and
+marker pose. It is not a segmentation of a measured droplet. At
+\(\delta=0\), the median normal-direction standard deviations are:
+\[
+\begin{array}{ll}
+\text{independent camera:} & \SI{28.50}{\micro\metre},\\
+\text{joint camera:} & \SI{6.02}{\micro\metre},\\
+\text{pixel contribution:} & \SI{2.37}{\micro\metre},\\
+\text{joint camera plus pixel:} & \SI{6.47}{\micro\metre}.
+\end{array}
+\]
+Thus the joint camera median is about 21\% of the independent camera
+median. This is the uncertainty reduction expected when the intrinsic--pose
+correlations are retained; it is not obtained by changing the pixel-noise
+assumption. Figure~\ref{fig:normal-sigma} shows the pointwise contributions.
+
+For visibility, Figure~\ref{fig:contour-bands} enlarges both normal bands
+10 times. Figure~\ref{fig:sample-contours} overlays 30 deterministic
+subsets from each saved Monte Carlo ensemble, with deviations from the
+nominal contour enlarged 10 times. The plotted subsets are for visual
+comparison only; statistics below use all 500 independent or 2000 joint
+samples.
+
+The apex-radius measure has mean and standard deviation
+\(\SI{1.522}{\milli\metre}\pm\SI{0.100}{\milli\metre}\) for the independent
+model and
+\(\SI{1.528}{\milli\metre}\pm\SI{0.026}{\milli\metre}\) for the joint model.
+Figure~\ref{fig:apex-radius} shows the corresponding full histograms.
+Figure~\ref{fig:modes} compares the leading contour-covariance modes,
+projected onto rigid translation/rotation, scale, and residual shape
+components. Each plotted mode is normalized to 100\%; modes with nearly
+equal eigenvalues can rotate within their shared subspace, so their
+individual component bars should not be over-interpreted.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\textwidth]{D1_normal_sigma_components.pdf}
+  \caption{Normal-direction standard deviation along normalized contour
+  arclength: independent camera, joint camera, pixel contribution, and joint
+  camera plus pixel. Values are plotted in micrometres.}
+  \label{fig:normal-sigma}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth]{D2_contour_uncertainty_bands.pdf}
+  \caption{Virtual contour with independent and joint normal-direction
+  one-standard-deviation bands. Both bands are enlarged by a factor of 10
+  for visibility; the contour itself is not enlarged.}
+  \label{fig:contour-bands}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth]{D3_sampled_contours.pdf}
+  \caption{Thirty independent and thirty joint sampled contours around the
+  same virtual baseline. Deviations are multiplied by 10 for display. The
+  samples are selected deterministically from the saved 500- and 2000-draw
+  ensembles.}
+  \label{fig:sample-contours}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth]{D4_apex_radius_histogram.pdf}
+  \caption{Apex-radius measure distributions from all independent and joint
+  contour draws. The radius axis is expressed in micrometres; the two
+  ensembles contain 500 and 2000 draws, respectively.}
+  \label{fig:apex-radius}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{D5_covariance_modes.pdf}
+  \caption{Rigid, scale, and residual-shape fractions for the five leading
+  camera covariance modes, computed separately for the independent and
+  joint camera contour covariances. Bars within each mode show the projected
+  fraction of that eigenvector; colors are consistent across panels.}
+  \label{fig:modes}
+\end{figure}
+
+\FloatBarrier
+\section{Assumptions and limitations}
+
+\begin{itemize}
+  \item The drop is assumed to lie in the marker plane,
+  \(\delta=0\). The separately computed relative-position assessment gives
+  \(Z=40.35\) mm and a break-even depth offset of about \(0.268\) mm for this
+  mount; a nonzero offset uncertainty is not included in the plotted
+  camera-only comparison.
+  \item The contour is a virtual \texttt{PD\_fn} contour, not an observed
+  boundary. Results therefore compare propagation models for this contour,
+  not measurement error against a known physical shape.
+  \item The pixel uncertainty \(\sigma_{\rm pix}=0.3\) px is a placeholder,
+  not a measured contour-noise level.
+  \item The four ArUco corners are perturbed independently using their
+  respective \(2\times2\) fitted covariances. Cross-corner correlations are
+  not estimated by \texttt{fit\_corner}.
+  \item Marker side length is treated as exact, and the pose covariance is
+  based on one marker in one zoom5 image. Other markers, images, and zoom
+  settings are not represented.
+  \item The intrinsic bootstrap and ArUco corner noise are independent.
+  The joint treatment captures the dependence created when the sampled
+  intrinsics are used in solvePnP; it does not jointly resample checkerboard
+  calibration images and marker observations.
+  \item The intrinsic bootstrap implementation does not explicitly seed its
+  NumPy random generator. This report uses the saved 500-draw cache rather
+  than claiming the calibration bootstrap can be recreated from the
+  camera-to-droplet seed.
+\end{itemize}
+
+\end{document}

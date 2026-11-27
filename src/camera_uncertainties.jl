@@ -2205,6 +2205,148 @@ result = (rotations, translations)
     return R_samples, t_samples
 end
 
+function apex_radius_measure(r::AbstractVector{<:Real}, z::AbstractVector{<:Real})
+    length(r) == length(z) ||
+        throw(ArgumentError("r and z lengths differ."))
+    indices = sortperm(abs.(r))[1:min(16, length(r))]
+    length(indices) >= 4 || return NaN
+    design = hcat(ones(length(indices)), Float64.(r[indices]).^2)
+    coefficient = design \ Float64.(z[indices])
+    curvature = abs(coefficient[2])
+    return curvature > eps(Float64) ? 1 / (2curvature) : Inf
+end
+
+"""
+Measure the deterministic pose and contour effects of shared 0.1 px corner shifts.
+
+The three cases apply the same shift to all corners in x, in y, or radially
+outward from their centroid. The contour displacements are median absolute
+normal components relative to the pose solved from the unshifted corners.
+"""
+function shared_corner_shift_sensitivity(
+    corners_px::AbstractMatrix{<:Real},
+    K::AbstractMatrix{<:Real},
+    dist::AbstractVector{<:Real},
+    marker_length_mm::Real,
+    virtual_u::AbstractVector{<:Real},
+    virtual_v::AbstractVector{<:Real},
+    intrinsics::AbstractVector{<:Real},
+    R_rel::AbstractMatrix{<:Real},
+    t_rel::AbstractVector{<:Real},
+    joint_camera_normal_sigma::AbstractVector{<:Real};
+    plane_coordinate::Real = 0.0,
+)
+    size(corners_px) == (4, 2) ||
+        throw(ArgumentError("corners_px must be a 4×2 matrix."))
+    size(K) == (3, 3) ||
+        throw(ArgumentError("K must be a 3×3 matrix."))
+    length(intrinsics) == 9 ||
+        throw(ArgumentError("intrinsics must contain nine values."))
+    length(virtual_u) == length(virtual_v) ||
+        throw(ArgumentError("virtual_u and virtual_v lengths differ."))
+    length(virtual_u) >= 4 ||
+        throw(ArgumentError("At least four virtual contour points are required."))
+    size(R_rel) == (3, 3) && length(t_rel) == 3 ||
+        throw(ArgumentError("Relative pose must contain a 3×3 rotation and 3-vector translation."))
+    length(joint_camera_normal_sigma) == length(virtual_u) ||
+        throw(ArgumentError("Joint camera sigma length must match the contour."))
+    marker_length_mm > 0 ||
+        throw(ArgumentError("marker_length_mm must be positive."))
+    all(isfinite, corners_px) && all(isfinite, K) && all(isfinite, dist) &&
+        all(isfinite, intrinsics) && all(isfinite, virtual_u) &&
+        all(isfinite, virtual_v) && all(isfinite, joint_camera_normal_sigma) ||
+        throw(ArgumentError("Inputs must contain only finite values."))
+    median_joint_camera_sigma_mm = median(joint_camera_normal_sigma)
+    median_joint_camera_sigma_mm > 0 ||
+        throw(ArgumentError("Median joint camera sigma must be positive."))
+
+    py"""
+import cv2, numpy as np
+
+corners = np.asarray($corners_px, dtype=np.float64).reshape(4, 2)
+camera_matrix = np.asarray($K, dtype=np.float64).reshape(3, 3)
+dist_coeffs = np.asarray($dist, dtype=np.float64).reshape(-1)
+marker_length = float($marker_length_mm)
+radial = corners - np.mean(corners, axis=0)
+radial_norms = np.linalg.norm(radial, axis=1)
+if np.any(radial_norms <= np.finfo(np.float64).eps):
+    raise ValueError("A corner coincides with the marker centroid.")
+outward = 0.1 * radial / radial_norms[:, None]
+corner_shifts = [
+    np.column_stack((np.full(4, 0.1), np.zeros(4))),
+    np.column_stack((np.zeros(4), np.full(4, 0.1))),
+    outward,
+]
+obj_points = np.array([
+    [-marker_length/2,  marker_length/2, 0],
+    [ marker_length/2,  marker_length/2, 0],
+    [ marker_length/2, -marker_length/2, 0],
+    [-marker_length/2, -marker_length/2, 0],
+], dtype=np.float64)
+rotations, translations = [], []
+for shift in [np.zeros((4, 2))] + corner_shifts:
+    success, rvec, tvec = cv2.solvePnP(
+        obj_points, corners + shift, camera_matrix, dist_coeffs)
+    if not success:
+        raise RuntimeError("solvePnP failed for a shared-corner shift case.")
+    rotation, _ = cv2.Rodrigues(rvec)
+    rotations.append(rotation.tolist())
+    translations.append(tvec.reshape(-1).tolist())
+result = (rotations, translations)
+"""
+    R_raw, t_raw = py"result"
+    rotations = Matrix{Float64}[
+        Matrix{Float64}(R_raw[i, :, :]) for i in axes(R_raw, 1)
+    ]
+    translations = Vector{Float64}[
+        Float64.(vec(t_raw[i, :])) for i in axes(t_raw, 1)
+    ]
+    R_reference, t_reference = rotations[1], translations[1]
+    reference_parameters = vcat(Float64.(intrinsics), zeros(6), 0.0)
+    r_reference, z_reference = inverse_project_camtodrop(
+        virtual_u, virtual_v, reference_parameters,
+        R_reference, t_reference, R_rel, t_rel;
+        plane_coordinate=plane_coordinate,
+    )
+    normals = contour_normals(r_reference, z_reference)
+    reference_apex_radius = apex_radius_measure(r_reference, z_reference)
+    labels = (
+        "a: all corners +0.1 px in x",
+        "b: all corners +0.1 px in y",
+        "c: all corners 0.1 px outward",
+    )
+    cases = map(2:4) do pose_index
+        rotation_change = 1_000 .* rotation_log(
+            transpose(R_reference) * rotations[pose_index],
+        )
+        translation_change = 1_000 .* (
+            translations[pose_index] .- t_reference
+        )
+        contour = sample_inverse_contour(
+            virtual_u, virtual_v, intrinsics,
+            vcat(rotation_change ./ 1_000, translation_change ./ 1_000),
+            0.0, R_reference, t_reference, R_rel, t_rel;
+            plane_coordinate=plane_coordinate,
+        )
+        r_case, z_case = unstack_rz(contour)
+        normal_displacement = (r_case .- r_reference) .* normals[:, 1] .+
+                              (z_case .- z_reference) .* normals[:, 2]
+        apex_radius_change =
+            apex_radius_measure(r_case, z_case) - reference_apex_radius
+        (
+            label=labels[pose_index - 1],
+            rotation_change_mrad=rotation_change,
+            translation_change_um=translation_change,
+            median_abs_normal_displacement_um=1_000 * median(abs.(normal_displacement)),
+            apex_radius_change_um=1_000 * apex_radius_change,
+        )
+    end
+    return (
+        cases=cases,
+        median_joint_camera_sigma_um=1_000 * median_joint_camera_sigma_mm,
+    )
+end
+
 function stack_rz(r::AbstractVector, z::AbstractVector)
     length(r) == length(z) || throw(ArgumentError("r and z lengths differ."))
     output = Vector{promote_type(eltype(r), eltype(z))}(undef, 2 * length(r))
