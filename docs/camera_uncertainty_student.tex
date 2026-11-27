@@ -1,0 +1,233 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=20mm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\graphicspath{{figures/student/}}
+
+\title{Camera Uncertainty: A Student-Friendly Guide}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Why do we need a camera model?}
+
+\textbf{What we do.} A camera records pixels, but a drop-shape model uses
+millimetres. We use a camera model to turn the drop's image outline into a
+physical shape; that shape can then be used to estimate surface tension.
+This overview asks how uncertainty in that conversion changes the
+reconstructed outline.
+
+\textbf{Why.} A small camera error can move or reshape the outline in
+millimetres. That can affect later estimates made from the drop's shape.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth,height=0.28\textheight,keepaspectratio]{01_pixels_to_surface_tension.pdf}
+  \caption{Pixels need camera geometry before they can describe a physical
+  drop. The drop shape in millimetres is the input to a later surface-tension
+  estimate.}
+\end{figure}
+
+\section{Two parts describe the camera setup}
+
+\textbf{What we do.} The \emph{intrinsic} settings describe the camera
+itself: lens magnification, the image centre, and lens distortion. The
+\emph{extrinsic} settings describe the camera's position and tilt relative
+to the ArUco marker beside the drop.
+
+\textbf{Why.} These settings come from different measurements. A checkerboard
+helps estimate the camera itself; the marker helps locate the camera for the
+drop measurement.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.84\textwidth,height=0.42\textheight,keepaspectratio]{02_camera_marker_drop_setup.pdf}
+  \caption{The marker provides a reference for the camera pose near the
+  drop. The camera-to-marker distance in this setup is about 40 mm; the
+  drawing is not to scale.}
+\end{figure}
+
+\clearpage
+\section{How do we estimate uncertainty in the camera itself?}
+
+\textbf{What we do.} The zoom5 calibration uses 49 checkerboard images, with
+117 detected corners per image. The spread of the measured image errors
+sets the size and direction of small corner shifts. The saved calibration
+bootstrap repeats the calibration 500 times with shifted corners; the
+histogram shows the resulting range of one focal length, \(f_x\).
+
+\textbf{Why.} It is difficult to work out by hand how small corner errors
+change all camera settings. Repeating the calibration with realistic small
+shifts shows how much the fitted settings can vary. These are the saved
+bootstrap results; no new calibrations are run for this guide.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth,height=0.46\textheight,keepaspectratio]{03_small_corner_shifts_bootstrap.pdf}
+  \caption{Small corner shifts lead to a spread in the fitted focal length.
+  The checkerboard and shifts on the left are an illustration; the
+  histogram on the right uses the saved 500 calibration results.}
+\end{figure}
+
+\clearpage
+\section{How does the marker locate the camera?}
+
+\textbf{What we do.} The image-processing code finds the four ArUco corners,
+then fits the two edges meeting at each corner. It uses six brightness
+profiles along each edge and the scatter of the fitted edge positions to
+estimate that corner's uncertainty. The pose bootstrap then uses the saved
+corner uncertainties to solve for the camera pose 1,000 times; the marker
+side is treated as exactly 10 mm.
+
+\textbf{Why.} If the image corners move slightly, the camera pose that
+explains them can move too. The faint outlines in the figure show 30 of the
+1,000 saved pose draws; the corner ellipses are enlarged 20 times so they
+can be seen.
+
+The fitting code uses edge-fit residuals to estimate corner uncertainty.
+No separate saved edge-residual review or pass/fail conclusion was found, so
+this guide does not claim that a separate residual check passed.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth,height=0.50\textheight,keepaspectratio]{04_marker_pose_bootstrap.pdf}
+  \caption{Small corner uncertainty produces a small spread in the fitted
+  marker outline. Yellow crosses mark the fitted corners, magenta ellipses
+  are enlarged by a factor of 20, and faint outlines show 30 saved
+  pose-bootstrap draws.}
+\end{figure}
+
+\clearpage
+\section{What do we assume about corner errors?}
+
+\textbf{What we do within one corner.} The code keeps the full two-direction
+uncertainty for each corner. Here the measured x--y correlations are small
+but not exactly zero: they are \(+0.038,-0.017,-0.008,-0.015\) for corners
+1--4. The left panel shows plotting-only shifts drawn with a fixed seed.
+
+\textbf{Why.} A corner is where two fitted edges meet. If the edges are
+tilted relative to the image's horizontal and vertical axes, an error in
+their positions can move the corner in both x and y. In this image the
+marker is almost upright, so the two directions are nearly unrelated.
+
+\textbf{What we do between corners.} The code treats the four corners'
+random fit errors as independent. Each corner uses its own short stretches
+of the two edges next to it; the stretches from neighboring corners do not
+overlap.
+
+\textbf{Why.} When pixel noise is local and the fitted regions do not share
+pixels, separate random fit errors are a reasonable approximation. This
+does not cover a shared effect such as blur, uneven lighting, biased edge
+placement, or ink spread that moves several corners together.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth,height=0.48\textheight,keepaspectratio]{05_corner_noise_assumptions.pdf}
+  \caption{The left panel shows one corner's nearly uncorrelated x and y
+  shifts. The right panel shows the separate edge stretches used by the
+  corner fits, with unused gaps between neighboring fits.}
+\end{figure}
+
+\clearpage
+\section{What if all corners share an error?}
+
+\textbf{What we do.} We test three fixed shifts without running Monte Carlo:
+all corners move 0.1 pixel in x, all move 0.1 pixel in y, or each moves
+0.1 pixel outwards so the marker looks slightly bigger. The largest median
+normal contour shift is about 0.73 micrometres, compared with about
+6 micrometres from the joint camera uncertainty.
+
+\textbf{Why.} A shared effect does not disappear just because four corners
+are averaged. For example, if the marker looks bigger than it really is,
+the pose solver can place the camera too close. The marker size is treated
+as exactly 10 mm here, so an error in its actual printed size is not
+included in these pixel-shift tests.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth,height=0.46\textheight,keepaspectratio]{06_shared_corner_errors.pdf}
+  \caption{An outward shared corner error makes the marker look bigger and
+  can make the solved camera distance shorter. In these three 0.1-pixel
+  tests, contour shifts stay below the joint camera uncertainty.}
+\end{figure}
+
+\clearpage
+\section{Why compare independent and joint camera errors?}
+
+\textbf{What we do.} In the independent calculation, a camera-intrinsic
+sample and a pose sample are chosen separately. In the joint calculation,
+each sampled set of camera intrinsics is used to solve the marker pose
+again. The joint draws therefore keep the link between the two kinds of
+camera uncertainty.
+
+\textbf{Why.} If one camera setting changes, the pose that explains the
+same marker image can change in response. The strongest saved link is
+between the image-centre setting \(c_y\) and camera translation
+\(\delta t_y\), with correlation about \(-0.98\). The requested
+\(f_x\)--\(t_z\) pair is positively linked too (about \(+0.65\)), but it is
+not the strongest pair, so the figure uses \(c_y\)--\(\delta t_y\).
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth,height=0.43\textheight,keepaspectratio]{08_strongest_joint_pair.pdf}
+  \caption{Independent draws have no link between the image-centre and pose
+  shifts. Joint draws show that opposite shifts tend to occur together, so
+  part of their effect can cancel.}
+\end{figure}
+
+\clearpage
+\section{What does that mean for the drop outline?}
+
+\textbf{What we do.} The saved virtual outline is passed through the saved
+camera draws. The joint calculation gives a median camera-related normal
+uncertainty of about \(6.0\,\mu\mathrm{m}\) per contour point; treating the
+intrinsics and pose as independent gives about \(28.5\,\mu\mathrm{m}\).
+The figure shows 30 saved outlines from each calculation, with deviations
+enlarged by the same factor of 10 so they are visible.
+
+\textbf{Why.} The joint calculation includes compensation between camera
+settings. For this virtual outline, the independent calculation is about
+4.7 times wider, so it is more pessimistic.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth,height=0.38\textheight,keepaspectratio]{07_independent_vs_joint_contours.pdf}
+  \caption{The independent model produces a wider spread of back-projected
+  outlines than the joint model. Deviations are enlarged by a factor of 10
+  in both panels.}
+\end{figure}
+
+\textbf{One more important assumption.} The drop is assumed to lie exactly
+in the marker plane. The camera is about 40 mm from the marker, and a depth
+offset of about 0.27 mm has the same median normal effect as the joint
+camera uncertainty. This offset is systematic for a fixed mount; repeated
+measurements with that mount do not average it away.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth,height=0.34\textheight,keepaspectratio]{09_summary_uncertainty.pdf}
+  \caption{Median normal uncertainty per outline point from the saved
+  analysis. The 0.27 mm depth-offset bar is the linearized effect of that
+  offset; the pixel-noise value is an assumed 0.3 pixel, not a measured
+  contour-detection error.}
+\end{figure}
+
+\section*{What is still simplified?}
+\begin{itemize}
+  \item The outline is a virtual model contour, not an edge detected from a
+  real drop photograph.
+  \item The drop-edge noise is assumed to be 0.3 pixel.
+  \item The marker side is treated as exactly 10 mm, and only one marker
+  image is used.
+  \item Shared corner errors such as blur or printing bias are not included.
+\end{itemize}
+
+\end{document}
